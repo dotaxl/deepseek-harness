@@ -34,8 +34,10 @@ import type {
 import {
   attributionHeaders,
   contentHasImage,
+  FinishReason,
   LlmAdapter,
   LlmError,
+  QUOTA_EXCEEDED_CODE,
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import type {
@@ -76,7 +78,23 @@ export interface PiAiAdapterOptions {
   resolveApiKey: (provider: string, profile: ResolvedPiAiProviderProfile) => Promise<string | undefined>
   /** Resolve the optional durable attachment service at request time. */
   resolveAttachments?: () => AttachmentStore | undefined
+  /**
+   * Called when a stream ends on a key-specific rejection (rate limit or a
+   * cooled-down quota/ban). The plugin stamps the just-used key as cooled down
+   * here so the next request rotates to a different one; the adapter never
+   * mutates rotation state itself.
+   * @param provider - the route whose key was rejected.
+   * @param code - the harness failure code (`RATE_LIMIT` or `QUOTA`).
+   */
+  onKeyFailure?: (provider: string, code: string) => void
 }
+
+/**
+ * Failure codes that name a single bad key rather than a request or model
+ * problem. On either, the adapter swallows the terminal finish and retries the
+ * request with the next key in the route's pool instead of ending the turn.
+ */
+const SWITCHABLE_FAILURE_CODES: ReadonlySet<string> = new Set(['RATE_LIMIT', QUOTA_EXCEEDED_CODE])
 
 /** Copy profile stream knobs into pi-ai's common option vocabulary. */
 function profileOptions(
@@ -289,70 +307,96 @@ export class PiAiAdapter extends LlmAdapter {
       model,
       options.reasoningEffort ?? profile.reasoning,
     )
-    const apiKey = await this.config.resolveApiKey(options.provider, profile)
 
-    const consumer = new AbortController()
-    const upstream = options.signal === undefined
-      ? consumer.signal
-      : AbortSignal.any([options.signal, consumer.signal])
-    const streamIdleTimeoutMs = profile.streamIdleTimeoutMs
-    using watchdog = idleWatchdog(upstream, streamIdleTimeoutMs, 'LLM_STREAM_IDLE_TIMEOUT')
-
-    try {
-      const containsImage = options.messages.some(message => contentHasImage(message.content))
-      if (containsImage && !model.input.includes('image')) {
-        throw new LlmError(`pi-ai model "${model.id}" does not support image input`, 'UNSUPPORTED_CONTENT')
-      }
-      const attachments = containsImage ? this.config.resolveAttachments?.() : undefined
-      if (containsImage && attachments === undefined) {
-        throw new LlmError('pi-ai image input requires the durable attachment service', 'UNSUPPORTED_CONTENT')
-      }
-      const context = attachments === undefined
-        ? toPiContext(options)
-        : await toPiContext(options, attachments)
-      const events = snapshot.models.streamSimple(model, context, {
-        ...profileOptions(profile, reasoning, apiKey),
-        ...options.temperature === undefined ? {} : { temperature: options.temperature },
-        ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
-        ...options.sessionId === undefined ? {} : { sessionId: String(options.sessionId) },
-        signal: watchdog.signal,
-        // Profile headers are deployment-owned; attribution names are
-        // Harness-owned and therefore win collisions.
-        headers: requestHeaders(profile.headers),
-      })
-      const iterator = toStreamChunks(events, model.contextWindow)[Symbol.asyncIterator]()
-      let exhausted = false
+    // Retry the request across the route's key pool on a key-specific
+    // rejection. Each attempt is its own SDK call; the active key rotates
+    // between attempts via `resolveApiKey` + `onKeyFailure`, so a rate-limited
+    // or banned key yields to the next without ending the turn. A single-key or
+    // keyless route makes exactly one attempt — behavior unchanged. The image
+    // and context preparation stays inside the attempt's try so a caller abort
+    // still classifies as `ABORTED` rather than surfacing a raw conversion error.
+    const total = profile.apiKeyRefs.length
+    for (let attempt = 0; ; attempt++) {
+      const consumer = new AbortController()
+      const upstream = options.signal === undefined
+        ? consumer.signal
+        : AbortSignal.any([options.signal, consumer.signal])
+      using watchdog = idleWatchdog(upstream, profile.streamIdleTimeoutMs, 'LLM_STREAM_IDLE_TIMEOUT')
+      const apiKey = await this.config.resolveApiKey(options.provider, profile)
       try {
-        while (true) {
-          const result = await watchdog.next(iterator)
-          const timeout = timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT')
-          if (timeout !== undefined) throw timeout
-          if (result.done) {
-            exhausted = true
-            return
-          }
-          yield result.value
+        const containsImage = options.messages.some(message => contentHasImage(message.content))
+        if (containsImage && !model.input.includes('image')) {
+          throw new LlmError(`pi-ai model "${model.id}" does not support image input`, 'UNSUPPORTED_CONTENT')
         }
+        const attachments = containsImage ? this.config.resolveAttachments?.() : undefined
+        if (containsImage && attachments === undefined) {
+          throw new LlmError('pi-ai image input requires the durable attachment service', 'UNSUPPORTED_CONTENT')
+        }
+        const context = attachments === undefined
+          ? toPiContext(options)
+          : await toPiContext(options, attachments)
+        const events = snapshot.models.streamSimple(model, context, {
+          ...profileOptions(profile, reasoning, apiKey),
+          ...options.temperature === undefined ? {} : { temperature: options.temperature },
+          ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+          ...options.sessionId === undefined ? {} : { sessionId: String(options.sessionId) },
+          signal: watchdog.signal,
+          // Profile headers are deployment-owned; attribution names are
+          // Harness-owned and therefore win collisions.
+          headers: requestHeaders(profile.headers),
+        })
+        const iterator = toStreamChunks(events, model.contextWindow)[Symbol.asyncIterator]()
+        let exhausted = false
+        let captured: FinishReason | undefined
+        try {
+          while (true) {
+            const result = await watchdog.next(iterator)
+            const timeout = timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT')
+            if (timeout !== undefined) throw timeout
+            if (result.done) {
+              exhausted = true
+              return
+            }
+            const chunk = result.value
+            // A key-specific rejection ends the stream; swallow it and rotate
+            // to the next key rather than surfacing it, unless no key remains.
+            if (chunk.type === 'finish' && chunk.reason.kind === 'error'
+              && SWITCHABLE_FAILURE_CODES.has(chunk.reason.failure.code)) {
+              captured = chunk.reason
+              break
+            }
+            yield chunk
+          }
+        } finally {
+          if (!exhausted) {
+            consumer.abort('pi-ai stream consumer stopped')
+            try {
+              await iterator.return(undefined)
+            } catch (_abortedSdkTeardown) {
+              // The stable signal already owns SDK termination; return-time abort cannot add an outcome.
+            }
+          }
+        }
+        // A switchable failure was captured inside the attempt loop (the only
+        // way to leave the inner `while` without returning). Rotate to the next
+        // key when one remains; otherwise surface the failure as the terminal chunk.
+        if (total > 1 && attempt < total - 1) {
+          this.config.onKeyFailure?.(options.provider, captured.failure.code)
+          continue
+        }
+        yield { type: 'finish', reason: captured }
+        return
+      } catch (error: unknown) {
+        if (timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT') !== undefined) {
+          throw new LlmError(`pi-ai stream idle timeout after ${profile.streamIdleTimeoutMs}ms`, 'TIMEOUT', { cause: error })
+        }
+        if (options.signal?.aborted) {
+          throw new LlmError('pi-ai request aborted by caller', 'ABORTED', { cause: error })
+        }
+        throw error
       } finally {
-        if (!exhausted) {
-          consumer.abort('pi-ai stream consumer stopped')
-          try {
-            await iterator.return(undefined)
-          } catch (_abortedSdkTeardown) {
-            // The stable signal already owns SDK termination; return-time abort cannot add an outcome.
-          }
-        }
+        consumer.abort('pi-ai stream consumer stopped')
       }
-    } catch (error: unknown) {
-      if (timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT') !== undefined) {
-        throw new LlmError(`pi-ai stream idle timeout after ${streamIdleTimeoutMs}ms`, 'TIMEOUT', { cause: error })
-      }
-      if (options.signal?.aborted) {
-        throw new LlmError('pi-ai request aborted by caller', 'ABORTED', { cause: error })
-      }
-      throw error
-    } finally {
-      consumer.abort('pi-ai stream consumer stopped')
     }
   }
 }

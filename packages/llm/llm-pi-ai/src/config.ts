@@ -34,6 +34,15 @@ import { buildProvider, supportedProtocols } from './provider.ts'
 /** Default maximum idle interval while an adapter stream read is outstanding. */
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000
 
+/**
+ * Cooldown applied to a key after a hard quota/ban rejection (e.g. a multi-hour
+ * circuit break). The key is skipped until it expires, then rejoins the pool.
+ */
+export const DEFAULT_KEY_COOLDOWN_MS = 5 * 3600 * 1000
+
+/** Cooldown applied to a key after a rate-limit (429) rejection; shorter because a rate limit is transient. */
+export const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 60_000
+
 /** Context capacity assumed for a model neither configuration nor the catalog sizes. */
 export const DEFAULT_CONTEXT_WINDOW = 262_144
 
@@ -65,6 +74,26 @@ export type {
 export interface PiAiProviderProfile {
   /** Credential reference (environment-variable name) resolved per request through `ctx.credentials`. */
   apiKeyEnv?: string
+  /**
+   * Additional credential references this route rotates through when a key is
+   * rate-limited or quota-banned. The primary still lives in {@link apiKeyEnv};
+   * every entry here joins it into one ordered pool. Rotation is per request
+   * and the keys themselves stay outside configuration files — only the
+   * references do.
+   */
+  apiKeyEnvs?: string[]
+  /**
+   * Cooldown (ms) applied to a key after a hard quota/ban rejection (e.g. a
+   * multi-hour circuit break); the key is skipped until it expires. Default
+   * {@link DEFAULT_KEY_COOLDOWN_MS} (5 hours).
+   */
+  keyCooldownMs?: number
+  /**
+   * Cooldown (ms) applied to a key after a rate-limit (429) rejection. Shorter
+   * than {@link keyCooldownMs} because a rate limit is transient. Default
+   * {@link DEFAULT_RATE_LIMIT_COOLDOWN_MS} (60 seconds).
+   */
+  rateLimitCooldownMs?: number
   /** Name shown by configuration surfaces; defaults to the route key. */
   displayName?: string
   /**
@@ -147,8 +176,14 @@ export interface ResolvedPiAiProviderProfile
   provider: string
   /** Resolved display name for selectors and configuration surfaces. */
   displayName: string
-  /** Validated credential reference, when one is configured. */
+  /** Validated primary credential reference, when one is configured; kept for the settings UI. */
   apiKeyEnv?: CredentialRef
+  /** Ordered credential references this route rotates through; never empty once one is configured. */
+  apiKeyRefs: readonly CredentialRef[]
+  /** Cooldown (ms) for a key after a hard quota/ban rejection. */
+  keyCooldownMs: number
+  /** Cooldown (ms) for a key after a rate-limit rejection. */
+  rateLimitCooldownMs: number
   /** Positive finite provider-idle interval after defaulting. */
   streamIdleTimeoutMs: number
   /** Immutable retry policy captured with this provider route. */
@@ -188,6 +223,9 @@ const thinkingBudgets = z.object({
 const compatProfile: z<PiAiCompatProfile> = z.object({
   thinkingFormat: z.union(SUPPORTED_THINKING_FORMATS),
   supportsReasoningEffort: z.boolean(),
+  supportsDeveloperRole: z.boolean(),
+  supportsStore: z.boolean(),
+  maxTokensField: z.union(['max_tokens', 'max_completion_tokens']),
 })
 
 /**
@@ -231,6 +269,7 @@ const modelOverride: z<PiAiModelOverride> = z.object(modelFields)
 
 const profile = z.object({
   apiKeyEnv: z.string().role('credential-ref'),
+  apiKeyEnvs: z.array(z.string()).role('credential-ref'),
   displayName: z.string(),
   api: z.union(supportedProtocols()),
   baseURL: z.string(),
@@ -248,6 +287,8 @@ const profile = z.object({
   timeoutMs: z.natural(),
   websocketConnectTimeoutMs: z.natural(),
   streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
+  keyCooldownMs: z.natural(),
+  rateLimitCooldownMs: z.natural(),
   retryPolicy: RetryPolicySchema,
 })
 
@@ -347,12 +388,28 @@ export function resolveProfiles(
       defaultContextWindow: source.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
       defaultMaxTokens: source.defaultMaxTokens ?? DEFAULT_MAX_TOKENS,
     })
-    const { apiKeyEnv, retryPolicy, models: _models, displayName: _displayName, ...rest } = source
+    const {
+      apiKeyEnv,
+      apiKeyEnvs,
+      keyCooldownMs,
+      rateLimitCooldownMs,
+      retryPolicy,
+      models: _models,
+      displayName: _displayName,
+      ...rest
+    } = source
+    const apiKeyRefs: CredentialRef[] = []
+    if (apiKeyEnv !== undefined) apiKeyRefs.push(credentialRef(apiKeyEnv))
+    for (const env of apiKeyEnvs ?? []) apiKeyRefs.push(credentialRef(env))
+    const primary = apiKeyRefs[0]
     resolved.set(provider, {
       ...rest,
       provider,
       displayName,
-      ...apiKeyEnv === undefined ? {} : { apiKeyEnv: credentialRef(apiKeyEnv) },
+      ...primary === undefined ? {} : { apiKeyEnv: primary },
+      apiKeyRefs,
+      keyCooldownMs: keyCooldownMs ?? DEFAULT_KEY_COOLDOWN_MS,
+      rateLimitCooldownMs: rateLimitCooldownMs ?? DEFAULT_RATE_LIMIT_COOLDOWN_MS,
       streamIdleTimeoutMs,
       retryPolicy: resolveRetryPolicy(retryPolicy, `llm-pi-ai: provider "${provider}" retryPolicy`),
       ...rest.headers === undefined ? {} : { headers: { ...rest.headers } },
@@ -364,7 +421,7 @@ export function resolveProfiles(
         ...source.api === undefined ? {} : { api: source.api },
         ...source.baseURL === undefined ? {} : { baseURL: source.baseURL },
         models: catalog.models,
-        namesCredential: apiKeyEnv !== undefined,
+        namesCredential: apiKeyRefs.length > 0,
       }),
     })
   }

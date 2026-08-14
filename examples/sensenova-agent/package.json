@@ -1,0 +1,7 @@
+{
+  "name": "sensenova-agent-example",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Runnable demo: one headless coding-agent turn backed by SenseNova's DeepSeek V4 Flash"
+}

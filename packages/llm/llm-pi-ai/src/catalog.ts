@@ -196,6 +196,12 @@ export interface PiAiCompatProfile {
   thinkingFormat?: PiAiThinkingFormat
   /** Whether the endpoint accepts `reasoning_effort`; absent keeps the catalog entry's, then pi-ai's baseURL-derived guess. */
   supportsReasoningEffort?: boolean
+  /** Whether the endpoint accepts the `developer` role; absent keeps pi-ai's baseURL-derived guess. */
+  supportsDeveloperRole?: boolean
+  /** Whether the endpoint accepts the `store` field; absent keeps the catalog entry's, then pi-ai's baseURL-derived guess. */
+  supportsStore?: boolean
+  /** Field that carries the max-tokens request cap; absent keeps the catalog entry's, then pi-ai's baseURL-derived guess. */
+  maxTokensField?: 'max_tokens' | 'max_completion_tokens'
 }
 
 /** One configured model entry: an id plus the catalog fields it overrides. */
@@ -394,11 +400,23 @@ function resolveModelCompat(
 ): { compat: OpenAICompletionsCompat } | Record<string, never> {
   const thinkingFormat = entry.compat?.thinkingFormat ?? route?.thinkingFormat
   const supportsReasoningEffort = entry.compat?.supportsReasoningEffort ?? route?.supportsReasoningEffort
-  if (thinkingFormat === undefined && supportsReasoningEffort === undefined) return {}
+  const supportsDeveloperRole = entry.compat?.supportsDeveloperRole ?? route?.supportsDeveloperRole
+  const supportsStore = entry.compat?.supportsStore ?? route?.supportsStore
+  const maxTokensField = entry.compat?.maxTokensField ?? route?.maxTokensField
+  if (
+    thinkingFormat === undefined && supportsReasoningEffort === undefined
+    && supportsDeveloperRole === undefined && supportsStore === undefined && maxTokensField === undefined
+  ) return {}
   if (api !== 'openai-completions') {
-    if (entry.compat?.thinkingFormat !== undefined || entry.compat?.supportsReasoningEffort !== undefined) {
-      invalid(provider, `model "${entry.id}" sets compat reasoning switches, but its api is "${api}";`
-        + ' thinkingFormat and supportsReasoningEffort exist only on openai-completions')
+    const bad: string[] = []
+    if (entry.compat?.thinkingFormat !== undefined) bad.push('thinkingFormat')
+    if (entry.compat?.supportsReasoningEffort !== undefined) bad.push('supportsReasoningEffort')
+    if (entry.compat?.supportsDeveloperRole !== undefined) bad.push('supportsDeveloperRole')
+    if (entry.compat?.supportsStore !== undefined) bad.push('supportsStore')
+    if (entry.compat?.maxTokensField !== undefined) bad.push('maxTokensField')
+    if (bad.length > 0) {
+      invalid(provider, `model "${entry.id}" sets compat switches (${bad.join(', ')}), but its api is "${api}";`
+        + ' these switches exist only on openai-completions')
     }
     return {}
   }
@@ -414,6 +432,9 @@ function resolveModelCompat(
       ...inherited,
       ...thinkingFormat === undefined ? {} : { thinkingFormat },
       ...supportsReasoningEffort === undefined ? {} : { supportsReasoningEffort },
+      ...supportsDeveloperRole === undefined ? {} : { supportsDeveloperRole },
+      ...supportsStore === undefined ? {} : { supportsStore },
+      ...maxTokensField === undefined ? {} : { maxTokensField },
     },
   }
 }
@@ -487,6 +508,9 @@ export function resolveRouteModels(request: RouteCatalogRequest): RouteCatalog {
   const routeApi = sharedCatalogApi(defaults)
   const routeCompatDefined = request.compat?.thinkingFormat !== undefined
     || request.compat?.supportsReasoningEffort !== undefined
+    || request.compat?.supportsDeveloperRole !== undefined
+    || request.compat?.supportsStore !== undefined
+    || request.compat?.maxTokensField !== undefined
   const seen = new Set<string>()
   const configuredMaxTokens = new Map<string, number>()
   const models = entries.map((entry) => {
@@ -539,8 +563,9 @@ export function resolveRouteModels(request: RouteCatalogRequest): RouteCatalog {
     }
   })
   if (routeCompatDefined && !models.some(model => model.api === 'openai-completions')) {
-    invalid(provider, 'sets compat reasoning switches, but no model on the route speaks openai-completions;'
-      + ' thinkingFormat and supportsReasoningEffort exist only on that protocol')
+    invalid(provider, 'sets compat switches, but no model on the route speaks openai-completions;'
+      + ' thinkingFormat, supportsReasoningEffort, supportsDeveloperRole, supportsStore, and maxTokensField'
+      + ' exist only on that protocol')
   }
   return { models, configuredMaxTokens }
 }

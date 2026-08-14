@@ -1,0 +1,219 @@
+# One-shot coding agent backed by SenseNova's OpenAI-compatible endpoint,
+# serving DeepSeek V4 Flash through it. The app bin loads the gitignored root
+# `.env` into the process environment; entry configs here are the composition
+# base, while user-plane values resolve per request through the two providers
+# below.
+#
+# This profile reuses the pi-ai-backed LLM adapter (`@deepseek-ai/dsh-llm-pi-ai`)
+# with a hand-declared route — no package source change. SenseNova speaks the
+# OpenAI Chat Completions protocol, so `api: openai-completions` reuses pi-ai's
+# existing adapter. Its thinking output arrives under `message.reasoning` /
+# `delta.reasoning`, which pi-ai already reads, so reasoning streams through
+# unchanged. `compat.supportsReasoningEffort: false` keeps the adapter from
+# sending a `reasoning_effort` parameter the SenseNova endpoint does not
+# document; the model's own default thinking still surfaces in the response.
+#
+# Set `SENSENOVA_API_KEY` (and the `SENSENOVA_API_KEY_2`…`_8` pool below) in
+# the environment or root `.env` (gitignored). The adapter rotates through all
+# eight on a rate limit or a quota ban (e.g. a multi-hour circuit break) before
+# giving up, so one saturated key does not stop the run.
+
+# User-settings document (`$DSH_HOME/settings.yaml`, hot-reloaded): a
+# `llm-pi-ai:` section there overrides the adapter entry below without a
+# restart.
+- id: settings
+  name: '@deepseek-ai/dsh-settings-file'
+
+# Credential store: the live process environment over `$DSH_HOME/.credentials.yaml`
+# (owner-only file, hot-reloaded). The adapter resolves `SENSENOVA_API_KEY`
+# through it at each request, so no key is inlined in this file.
+- id: credentials
+  name: '@deepseek-ai/dsh-credentials-local'
+
+# The SenseNova-backed LLM adapter: a hand-declared `openai-completions` route
+# pointed at SenseNova's token endpoint. Swap the model id if SenseNova lists
+# DeepSeek V4 Flash under a different string.
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      sensenova-deepseek:
+        displayName: SenseNova DeepSeek V4 Flash
+        apiKeyEnv: SENSENOVA_API_KEY
+        # Key pool: on a rate limit (429) or a quota ban, the adapter cools the
+        # rejecting key down and retries with the next reference rather than
+        # ending the turn. Set each in the environment or root `.env`.
+        apiKeyEnvs:
+          - SENSENOVA_API_KEY_2
+          - SENSENOVA_API_KEY_3
+          - SENSENOVA_API_KEY_4
+          - SENSENOVA_API_KEY_5
+          - SENSENOVA_API_KEY_6
+          - SENSENOVA_API_KEY_7
+          - SENSENOVA_API_KEY_8
+          - SENSENOVA_API_KEY_9
+          - SENSENOVA_API_KEY_10
+        api: openai-completions
+        baseURL: https://token.sensenova.cn/v1
+        # Failover across keys is owned by the adapter's rotation loop, so the
+        # recovery policy does not also retry rate-limit/quota here (that would
+        # re-run the whole loop). Other transient codes can be re-enabled by
+        # widening `retryableCodes`.
+        retryPolicy:
+          mode: normal
+          maxRetries: 0
+        compat:
+          # `openai` is not one of the special-cased thinking formats, so request
+          # building falls through to the generic OpenAI branch, which gates
+          # every thinking parameter on `supportsReasoningEffort` — with it
+          # false, no thinking parameter is ever sent. SenseNova's OpenAI
+          # endpoint documents neither `reasoning_effort` nor the `developer`
+          # role nor the `store` field, and expects `max_tokens` (not
+          # `max_completion_tokens`), so the four switches below pin pi-ai's
+          # URL-based auto-detection to what SenseNova actually accepts.
+          thinkingFormat: openai
+          supportsReasoningEffort: false
+          supportsDeveloperRole: false
+          supportsStore: false
+          maxTokensField: max_tokens
+        models:
+          - id: deepseek-v4-flash
+            name: DeepSeek V4 Flash (SenseNova)
+            contextWindow: 128000
+            maxTokens: 8192
+            # Declares the model reasons; the wire level is never sent because
+            # `supportsReasoningEffort` is false, so this only labels capability.
+            reasoningEfforts:
+              off:
+              max: max
+
+# Managed child-process groups for the bash executor (spawn/kill/output plumbing).
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+
+- id: bash
+  name: '@deepseek-ai/dsh-bash-local'
+  config:
+    timeoutMs: 60000
+
+# The example composition pre-creates one fresh `main` agent for its test driver.
+- id: agent-spine
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    agents:
+      - id: main
+        provider: sensenova-deepseek
+        model: deepseek-v4-flash
+        cwd: !!js process.cwd()
+    workspaceContext:
+      maxBytes: 65536
+    persona: |
+      You are sensenova-agent, a coding assistant powered by the {{model}} model
+      (DeepSeek V4 Flash served through SenseNova).
+
+      Verify your work by running the code or tests. Keep answers brief and
+      factual.
+
+- id: persistence
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: './.sessions'
+    compression: !!js "process.env.DSH_SNAPSHOT === undefined ? 'zstd' : 'none'"
+
+- id: checkpoint-policy
+  name: '@deepseek-ai/dsh-session-checkpoint-policy'
+
+# Summarize an older range when derived history approaches the context window.
+- id: token-meter
+  name: '@deepseek-ai/dsh-token-meter'
+
+- id: compaction-basic
+  name: '@deepseek-ai/dsh-compaction-basic'
+  config:
+    thresholdRatio: 0.8
+    retainRatio: 0.16
+    maxTokens: 8192
+    compactionRetries: 1
+
+# Projection registry: durable subagent identity (mode/label) folds through
+# its registered units; subagent catalog reads fail loud without the capability.
+- id: session-projection
+  name: '@deepseek-ai/dsh-session-projection'
+
+# Expose fresh-child `spawn` and completed-prefix `fork` through independent
+# in-process backends.
+- id: subagent
+  name: '@deepseek-ai/dsh-subagent'
+
+- id: subagent-spawn-in-process
+  name: '@deepseek-ai/dsh-subagent-spawn-in-process'
+  config:
+    providerName: spawn
+
+- id: subagent-fork-in-process
+  name: '@deepseek-ai/dsh-subagent-fork-in-process'
+  config:
+    providerName: fork
+
+# Continuable background children are selected per delegation tool. The
+# separately loaded control registers global `send_message`; `report` is
+# installed only in continuable child scopes.
+- id: tool-subagent-control
+  name: '@deepseek-ai/dsh-tool-subagent-control'
+
+- id: tool-subagent-report
+  name: '@deepseek-ai/dsh-tool-subagent-report'
+
+- id: tool-subagent
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: subagent
+    backgroundMode: continuable
+    maxDepth: 1
+
+# Fork stays one-shot because a continuable child's `report` tool and prompt
+# section precede the inherited history a fork reuses; `run_in_background` is off
+# because this example mounts no task service. See .agents/notes/implemented/architecture/2026-08-10-fork-children-stay-one-shot.md.
+- id: tool-subagent-fork
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: fork
+    toolName: subagent_fork
+    backgroundMode: one-shot
+    enableRunInBackground: false
+    maxDepth: 1
+
+# The worker-thread workflow engine fans a model-written JavaScript script's
+# `agent()` calls out through the spawn backend.
+- id: workflow-worker-thread
+  name: '@deepseek-ai/dsh-workflow-worker-thread'
+  config:
+    provider: spawn
+
+- id: tool-workflow
+  name: '@deepseek-ai/dsh-tool-workflow'
+
+# A separate fixed consumer demonstrates fresh-agent Ralph iteration without
+# changing the workflow tool or same-session goal behavior.
+- id: tool-ralph
+  name: '@deepseek-ai/dsh-tool-ralph'
+
+# `todo_write` replaces the logged whole list.
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+# Policy loads before the model-facing filesystem tools so writes and edits
+# require an observed file. Relative paths resolve from the process cwd.
+- id: fs-local
+  name: '@deepseek-ai/dsh-fs-local'
+  config:
+    cwd: !!js process.cwd()
+
+- id: fs-observation-policy
+  name: '@deepseek-ai/dsh-fs-observation-policy'
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'

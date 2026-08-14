@@ -914,6 +914,26 @@ export interface Config {
 export interface PiAiProviderProfile {
   /** Credential reference (environment-variable name) resolved per request through `ctx.credentials`. */
   apiKeyEnv?: string
+  /**
+   * Additional credential references this route rotates through when a key is
+   * rate-limited or quota-banned. The primary still lives in {@link apiKeyEnv};
+   * every entry here joins it into one ordered pool. Rotation is per request
+   * and the keys themselves stay outside configuration files — only the
+   * references do.
+   */
+  apiKeyEnvs?: string[]
+  /**
+   * Cooldown (ms) applied to a key after a hard quota/ban rejection (e.g. a
+   * multi-hour circuit break); the key is skipped until it expires. Default
+   * {@link DEFAULT_KEY_COOLDOWN_MS} (5 hours).
+   */
+  keyCooldownMs?: number
+  /**
+   * Cooldown (ms) applied to a key after a rate-limit (429) rejection. Shorter
+   * than {@link keyCooldownMs} because a rate limit is transient. Default
+   * {@link DEFAULT_RATE_LIMIT_COOLDOWN_MS} (60 seconds).
+   */
+  rateLimitCooldownMs?: number
   /** Name shown by configuration surfaces; defaults to the route key. */
   displayName?: string
   /**
@@ -1051,6 +1071,12 @@ export interface PiAiCompatProfile {
   thinkingFormat?: PiAiThinkingFormat
   /** Whether the endpoint accepts `reasoning_effort`; absent keeps the catalog entry's, then pi-ai's baseURL-derived guess. */
   supportsReasoningEffort?: boolean
+  /** Whether the endpoint accepts the `developer` role; absent keeps pi-ai's baseURL-derived guess. */
+  supportsDeveloperRole?: boolean
+  /** Whether the endpoint accepts the `store` field; absent keeps the catalog entry's, then pi-ai's baseURL-derived guess. */
+  supportsStore?: boolean
+  /** Field that carries the max-tokens request cap; absent keeps the catalog entry's, then pi-ai's baseURL-derived guess. */
+  maxTokensField?: 'max_tokens' | 'max_completion_tokens'
 }
 
 /** One request modality a pi-ai model may accept. */

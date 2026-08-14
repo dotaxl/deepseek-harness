@@ -32,6 +32,12 @@
  *         apiKeyEnv: ACME_GATEWAY_API_KEY
  *         api: openai-completions
  *         baseURL: https://gateway.acme.example/v1
+ *         # Optional pool: on a rate limit or quota ban the adapter rotates to
+ *         # the next key instead of ending the turn. `keyCooldownMs` /
+ *         # `rateLimitCooldownMs` tune the cooldown per failure kind.
+ *         apiKeyEnvs:
+ *           - ACME_GATEWAY_API_KEY_2
+ *           - ACME_GATEWAY_API_KEY_3
  *         # Reasoning dialect for a URL pi-ai cannot recognize.
  *         compat:
  *           thinkingFormat: deepseek
@@ -57,12 +63,18 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
-import { assertUsableApiKey, LlmError } from '@deepseek-ai/dsh-llm'
+import { assertUsableApiKey, LlmError, QUOTA_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
 import type { AdapterRegistrationHandle, DirectoryRegistrationHandle, LlmConfigurableProvider } from '@deepseek-ai/dsh-llm'
 import { deepEqualJson, installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { PiAiAdapter } from './adapter.ts'
 import { catalogProviderIds, catalogProviderTakesApiKey } from './catalog.ts'
 import { assertServiceable, Config, resolveProfiles } from './config.ts'
+import {
+  coolDownKey,
+  createKeyRotationState,
+  selectActiveKey,
+  type KeyRotationState,
+} from './key-rotation.ts'
 import type { ResolvedPiAiProviderProfile } from './config.ts'
 import { discoverModels } from './discovery.ts'
 
@@ -172,11 +184,27 @@ export function apply(ctx: Context, config: Config): void {
   }
   profiles()
 
+  // Per-route key rotation: the active key for each request, and the cooldown
+  // stamped on a key after a key-specific rejection (rate limit or quota ban).
+  // `resolveApiKey` and `onKeyFailure` share this map so a rejected key is the
+  // one the next request skips. The state rebuilds when a route's reference
+  // pool changes identity (a new configuration), dropping stale cooldowns.
+  const rotation = new Map<string, KeyRotationState>()
+  function rotationStateFor(provider: string, profile: ResolvedPiAiProviderProfile): KeyRotationState {
+    const existing = rotation.get(provider)
+    if (existing !== undefined && existing.refs === profile.apiKeyRefs) return existing
+    const created = createKeyRotationState(profile.apiKeyRefs)
+    rotation.set(provider, created)
+    return created
+  }
+
   const resolveApiKey = async (
     provider: string,
     profile: ResolvedPiAiProviderProfile,
   ): Promise<string | undefined> => {
-    const ref = profile.apiKeyEnv
+    // Pick the next usable key from this route's rotation pool; an empty pool
+    // (no apiKeyEnv and no apiKeyEnvs) defers to pi-ai's own discovery.
+    const ref = selectActiveKey(rotationStateFor(provider, profile), Date.now())
     // Only a profile that names no credential at all defers to pi-ai's
     // provider-native discovery. Once one is named, a miss must fail loud:
     // handing pi-ai `undefined` would let it pick up an unrelated ambient key
@@ -197,10 +225,24 @@ export function apply(ctx: Context, config: Config): void {
     )
   }
 
+  // Stamp the just-used key as cooled down after a key-specific rejection, so
+  // the next request rotates to a different one. `QUOTA` is the hard ban
+  // (e.g. a multi-hour circuit break) and uses the longer cooldown; any other
+  // switchable failure cools the key only briefly.
+  const onKeyFailure = (provider: string, code: string): void => {
+    const profile = profiles().get(provider)
+    if (profile === undefined || profile.apiKeyRefs.length === 0) return
+    const cooldownMs = code === QUOTA_EXCEEDED_CODE
+      ? profile.keyCooldownMs
+      : profile.rateLimitCooldownMs
+    coolDownKey(rotationStateFor(provider, profile), cooldownMs, Date.now())
+  }
+
   const adapter = new PiAiAdapter({
     profiles,
     resolveApiKey,
     resolveAttachments: () => ctx.get('attachments'),
+    onKeyFailure,
   })
   // The full installed catalog is configurable from the moment the plugin
   // mounts — dormant or not — so configuration surfaces can offer every
