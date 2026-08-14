@@ -24,6 +24,7 @@ import type { ResolvedRetryPolicy, RetryPolicyConfig } from '@deepseek-ai/dsh-ll
 import { MODALITIES, resolveRouteModels, SUPPORTED_THINKING_FORMATS, THINKING_LEVELS } from './catalog.ts'
 import type {
   PiAiCompatProfile,
+  PiAiFailoverTarget,
   PiAiModality,
   PiAiModelOverride,
   PiAiModelProfile,
@@ -201,6 +202,15 @@ export interface ResolvedPiAiProviderProfile
    * own, so a catalog capability must not appear here.
    */
   configuredMaxTokens: ReadonlyMap<string, number>
+  /**
+   * Backup routes declared per model, in the order to try them. The adapter
+   * walks this list only after a model's own key pool is exhausted on an
+   * account-level failure; resolution has already refused any target that
+   * names an unknown route or a route that does not serve the (remapped) model.
+   */
+  failover: ReadonlyMap<string, readonly PiAiFailoverTarget[]>
+  /** Every model id this route serves, for failover-target validation. */
+  modelIds: readonly string[]
 }
 
 /** Plugin configuration: the provider routes this instance owns. */
@@ -243,6 +253,12 @@ const reasoningEfforts = z.dict(
   z.union(THINKING_LEVELS),
 ) as unknown as z<PiAiReasoningEfforts>
 
+/** One backup route entry in a model's `failover` list. */
+const failoverTarget = z.object({
+  provider: z.string().required(),
+  model: z.string(),
+}) as unknown as z<PiAiFailoverTarget>
+
 /** The fields a `models` entry and a `modelOverrides` value share; only the id's home differs. */
 const modelFields = {
   name: z.string(),
@@ -257,6 +273,11 @@ const modelFields = {
   // installed catalog's capability", while `false` disables reasoning.
   reasoningEfforts: z.union([z.const(false), reasoningEfforts]),
   compat: compatProfile,
+  // Backup routes tried after this model's key pool is exhausted on an
+  // account-level failure. Empty list is materialized for an absent field and
+  // means no backup; the cross-route existence/serves-model check runs in
+  // `resolveProfiles`, which needs every route's materialized models.
+  failover: z.array(failoverTarget),
 }
 
 const modelProfile: z<PiAiModelProfile> = z.object({
@@ -415,6 +436,8 @@ export function resolveProfiles(
       ...rest.headers === undefined ? {} : { headers: { ...rest.headers } },
       ...rest.thinkingBudgets === undefined ? {} : { thinkingBudgets: { ...rest.thinkingBudgets } },
       configuredMaxTokens: catalog.configuredMaxTokens,
+      failover: catalog.failover,
+      modelIds: catalog.models.map(model => model.id),
       piProvider: buildProvider({
         provider,
         displayName,
@@ -424,6 +447,28 @@ export function resolveProfiles(
         namesCredential: apiKeyRefs.length > 0,
       }),
     })
+  }
+  // Second pass: failover targets name *other* routes, so they can only be
+  // checked once every route's materialized models exist. A target that names
+  // its own route, an unknown route, or a route that does not serve the
+  // (remapped) model is refused here, where the configuration is written,
+  // rather than failing a request at an unserviceable backup mid-turn.
+  for (const [provider, profile] of resolved) {
+    for (const [modelId, targets] of profile.failover) {
+      for (const target of targets) {
+        if (target.provider === provider) {
+          throw new Error(`llm-pi-ai: provider "${provider}" model "${modelId}" failover lists its own route`)
+        }
+        const backup = resolved.get(target.provider)
+        if (backup === undefined) {
+          throw new Error(`llm-pi-ai: provider "${provider}" model "${modelId}" failover names unknown route "${target.provider}"`)
+        }
+        const backupModel = target.model ?? modelId
+        if (!backup.modelIds.includes(backupModel)) {
+          throw new Error(`llm-pi-ai: provider "${provider}" model "${modelId}" failover targets route "${target.provider}" which does not serve model "${backupModel}"`)
+        }
+      }
+    }
   }
   return resolved
 }

@@ -75,7 +75,7 @@
 
 ## Catalog 解析
 
-profile 的 `models` 列表是*替换*该路由已安装 catalog，而不是扩充它；省略它（或留空）则原样服务该 catalog。每个条目都会从同 `id` 的已安装模型继承自身未设置的字段，因此把 catalog 路由收窄到两个模型、更正某个容量，或加入一个比已安装 catalog 更新的模型，都是一行编辑——但一旦声明了 `models` 列表，该路由要继续服务的每个模型就都必须出现在其中，条目哪怕只写一个 `id` 也足够。可配置的条目字段是 `id`、`name`、`contextWindow`、`maxTokens`、`reasoningEfforts` 与 `compat`。定价与输入模态没有 harness 消费方，因此沿用已安装条目或直接缺席。
+profile 的 `models` 列表是*替换*该路由已安装 catalog，而不是扩充它；省略它（或留空）则原样服务该 catalog。每个条目都会从同 `id` 的已安装模型继承自身未设置的字段，因此把 catalog 路由收窄到两个模型、更正某个容量，或加入一个比已安装 catalog 更新的模型，都是一行编辑——但一旦声明了 `models` 列表，该路由要继续服务的每个模型就都必须出现在其中，条目哪怕只写一个 `id` 也足够。可配置的条目字段是 `id`、`name`、`contextWindow`、`maxTokens`、`reasoningEfforts`、`compat` 与 `failover`。定价与输入模态没有 harness 消费方，因此沿用已安装条目或直接缺席。
 
 `modelOverrides` 无需这份代价就能就地重塑单个已安装 catalog 模型：每个键是一个 catalog 模型 id，每个值可写 `models` 条目接受的同一批字段，只是 id 落在键上，而 catalog 的其余部分原样继续服务——「改一个模型、其余三十七个原样保留」只是一次三行编辑。一条覆盖会成为该 catalog 条目的配置，因此容量、档位与 compat 沿与 `models` 条目相同的路径解析，携带相同的诊断与相同的请求默认值语义。覆盖只在正服务自身 catalog 的 catalog 路由上才有意义：与 `models` 列表并存的一份（该列表本就替换了 catalog）、落在手工声明路由上的一份（其模型已在 `models` 中完整写出），或点名了 catalog 未描述模型的一份，都会被拒绝而非跳过，因为一个静默保持原样的模型，就是一个否则要有人费力追查的笔误。
 
@@ -125,6 +125,43 @@ profile 的 `models` 列表是*替换*该路由已安装 catalog，而不是扩�
 轮转状态位于插件的 `apply()` 闭包里，以路由为键，并在每次请求的 `resolveApiKey`（选取下一个可用 key）与 `onKeyFailure`（冷却刚刚用过的 key）之间共享。由于 `stream()` 每次尝试只发起一次提供方请求，一个有 N 个 key 的路由在暴露失败之前最多重试 N−1 次——没有隐藏的乘数。当一条路由的引用池身份发生变化时，状态会重建并丢弃过期的冷却，因此一次 settings 编辑会在下一次请求时生效。
 
 请刻意地把这项能力与 agent 级 `llm-retry` 策略组合使用：适配器已经处理了限流/配额的故障转移，因此路由的 `retryPolicy` 无需再重试这些码（重试会重新跑整轮轮转循环）。把 `retryableCodes` 留给瞬时传输/服务端错误，或者设 `maxRetries: 0`，把全部故障转移交给密钥池。
+
+## 跨提供方故障转移
+
+密钥池轮转能在*某一个* key 被拒时挽救一轮运行，但当拒绝是**账户级**时它就无能为力：限流、配额/封禁，或点名整个账户而非单个凭据的 403 `AUTH` 拒绝。当一条路由的 key 共享同一个账户——厂商提供的多 key 套餐通常如此——某个账户上限（例如「5 小时使用上限」）会一次性拒绝所有 key，于是在路由内轮转只是把同一个拒绝重放一遍，直到池被耗尽、轮次结束。唯一的恢复办法是一个*不同*的账户，落到实践里就是一条不同的提供方路由。
+
+`failover` 是一个**按模型**的备份路由列表，适配器会在该模型自身的密钥池于账户级失败上耗尽后才依次走过它。每个条目点名另一条同样服务该模型的路由，并可附带一个 `model` 改写在线路上用的 id——当备份以不同名称拼写同一模型时：
+
+```yaml
+providers:
+  sensenova-deepseek:
+    apiKeyEnv: SENSENOVA_API_KEY
+    apiKeyEnvs: [SENSENOVA_API_KEY_2, …, SENSENOVA_API_KEY_10]
+    api: openai-completions
+    baseURL: https://token.sensenova.cn/v1
+    models:
+      - id: deepseek-v4-flash
+        reasoningEfforts:
+          off:
+          high: high
+        failover:
+          - provider: qwen-token-plan
+            model: deepseek-v4-flash-0731
+  qwen-token-plan:
+    apiKeyEnv: QWEN_TOKEN_PLAN_API_KEY
+    baseURL: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+    models:
+      - id: deepseek-v4-flash-0731
+        reasoningEfforts:
+          off:
+          high: high
+```
+
+故障转移链是「被选中的路由，然后是其声明的备份按序排列」。在一条路由内部，密钥池会如上先轮转到耗尽；只有*该路由上每个* key 都用尽之后，适配器才会把捕获到的失败交给下一条路由，而那条路由会重新从头启用自己的池。在链的**最后**一条路由上捕获到的失败，会以该轮次的终止 `finish {kind:'error'}` 形式呈现，因此一条完全耗尽的链仍会像从前一样结束这一轮——故障转移永远只*追加*路由，绝不循环，也绝不软化一个真正走投无路的终点。链只由*被选中的*模型的 `failover` 构建，因此备份路由自身的 `failover` 会被忽略，除非该备份本身就是被选中的路由：不存在递归，也不存在两条互列彼此的路由之间的乒乓。
+
+`AUTH`（403）也属于可切换码之一，因此 403 账户拒绝会像 429 一样轮转密钥池，而池一旦耗尽就交给备份路由——一个路由在自己账户上无权使用的模型，会在备份的账户上重试，而不是结束这一轮。同样的跨路由存在性检查会拒绝点名自身路由、未知路由，或服务不了（改写的）模型的路由的 `failover` 条目，因此笔误会在加载时失败（`settings-rejected`，点名路由与模型），而不是在轮次中途把请求静默丢给一个不可服务的备份。
+
+刻意地把两种机制组合起来：密钥池是**账户内**轮转（同一厂商上一个 key 换另一个），`failover` 是**跨账户 / 跨厂商**轮转（一个厂商换另一个）。单 key 路由带 `failover` 会在第一次账户级拒绝时直接跳到备份；多 key 路由会先耗尽自身池，再故障转移。两者都在一次 `stream()` 调用内部，因此 `retryPolicy` 仍应避免重试同样的那些可切换码，或设 `maxRetries: 0`，以免 agent 级重试把整条链重跑一遍。
 
 ## 端点询问
 

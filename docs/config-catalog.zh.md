@@ -1046,6 +1046,13 @@ export interface PiAiModelProfile {
   reasoningEfforts?: false | PiAiReasoningEfforts
   /** Reasoning-dispatch switches for this model, winning over the route's. */
   compat?: PiAiCompatProfile
+  /**
+   * Backup provider routes tried in order after this model's own key pool is
+   * exhausted on an account-level failure. Each entry names another route that
+   * serves the same model (see {@link PiAiFailoverTarget}); `resolveProfiles`
+   * refuses any entry that names an unknown route or one not serving the model.
+   */
+  failover?: PiAiFailoverTarget[]
 }
 
 /**
@@ -1091,6 +1098,23 @@ export type PiAiModality = Model<Api>['input'][number]
  * from the dict is not offered.
  */
 export type PiAiReasoningEfforts = Partial<Record<ModelThinkingLevel, string | null>>
+
+/**
+ * One backup provider route tried after this model's own key pool is exhausted
+ * on an account-level failure (a rate limit, a quota/ban, or an auth denial).
+ * The backup must serve the same model under its own wire id; when that id
+ * differs — a different vendor names the same model differently — `model`
+ * remaps it so the retried request carries the backup's spelling. Resolution
+ * refuses a target that names an unknown route or a route that does not serve
+ * the (remapped) model, so a typo fails loud where it is written rather than
+ * silently abandoning a request to an unserviceable route at request time.
+ */
+export interface PiAiFailoverTarget {
+  /** Backup provider route key that also serves the failed-over request. */
+  provider: string
+  /** Wire model id on that route; absent sends the same id as the original model. */
+  model?: string
+}
 
 /** One reasoning-dispatch wire format a profile may name. */
 export type PiAiThinkingFormat = Exclude<PiThinkingFormat, WithheldThinkingFormat>

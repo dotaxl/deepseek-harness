@@ -93,8 +93,14 @@ export interface PiAiAdapterOptions {
  * Failure codes that name a single bad key rather than a request or model
  * problem. On either, the adapter swallows the terminal finish and retries the
  * request with the next key in the route's pool instead of ending the turn.
+ * The same set also drives cross-provider failover: a captured failure in this
+ * set, once a route's key pool is exhausted, moves the request to the next
+ * backup route (see {@link PiAiAdapter.stream}). `AUTH` is included because a
+ * 403 account denial (e.g. an unpurchased model) is key-specific when a route
+ * pools credentials from separate accounts — rotating past it, or failing over
+ * to a different vendor, is the correct recovery rather than ending the turn.
  */
-const SWITCHABLE_FAILURE_CODES: ReadonlySet<string> = new Set(['RATE_LIMIT', QUOTA_EXCEEDED_CODE])
+const SWITCHABLE_FAILURE_CODES: ReadonlySet<string> = new Set(['RATE_LIMIT', QUOTA_EXCEEDED_CODE, 'AUTH'])
 
 /** Copy profile stream knobs into pi-ai's common option vocabulary. */
 function profileOptions(
@@ -291,6 +297,13 @@ export class PiAiAdapter extends LlmAdapter {
     })
   }
 
+  /**
+   * Outcome of streaming one provider route: the request completed, or it ended
+   * on a captured account-level failure whose code the caller uses to decide
+   * whether to fail over to the next route.
+   */
+  private readonly failoverOutcomeOk: FailoverOutcome = { ok: true }
+
   async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     if (options.stop !== undefined) {
       throw new LlmError('llm-pi-ai does not support GenerateOptions.stop', 'UNSUPPORTED_OPTION')
@@ -301,20 +314,89 @@ export class PiAiAdapter extends LlmAdapter {
     // mid-request builds a separate snapshot, so this request finishes under
     // the one it started with and the next call picks up the new one.
     const snapshot = this.current()
-    const profile = this.profileOf(snapshot, options.provider)
-    const model = this.modelOf(snapshot, options.provider, options.model)
+    // The selected route first, then its declared backup routes in order. Each
+    // entry is tried whole (its own key pool rotated to exhaustion) before the
+    // next; only after every route is exhausted does the turn end. The chain is
+    // never empty — the selected route is always first — so the loop below runs
+    // at least once and `lastFailure` is always set by the time it ends.
+    const chain = this.failoverChain(snapshot, options.provider, options.model)
+    let lastFailure!: FinishReason
+    for (const [ci, target] of chain.entries()) {
+      const isLast = ci === chain.length - 1
+      const result = yield * this.streamOnProvider(snapshot, target.provider, target.model, options, isLast)
+      if (result.ok) return
+      // The route that just failed is cooled where the failure was captured
+      // (see streamOnProvider): a non-last route cools and returns, the last
+      // route cools on each rotation and on its terminal surface.
+      lastFailure = result.failure
+    }
+    yield { type: 'finish', reason: lastFailure }
+  }
+
+  /**
+   * The ordered failover chain for one request: the selected route, then its
+   * declared backup routes (with each target's wire-model remap applied).
+   * Resolution has already refused any target that names an unknown route or a
+   * route that does not serve the (remapped) model, so a stale reference left
+   * by a later settings edit is the only way a listed route could vanish; the
+   * guard drops such an entry instead of looping or failing a request on it.
+   * @param snapshot - the frozen profile/collection snapshot for this operation.
+   * @param provider - the originally selected provider route.
+   * @param model - the originally selected model id.
+   * @returns the route/model pairs to try, in order.
+   */
+  private failoverChain(
+    snapshot: PiAiSnapshot,
+    provider: string,
+    model: string,
+  ): readonly { provider: string; model: string }[] {
+    const profile = this.profileOf(snapshot, provider)
+    // `resolveProfiles` has already refused any target that names an unknown
+    // route or a route that does not serve the (remapped) model, so every
+    // declared target references a route present in this same snapshot.
+    const declared = profile.failover.get(model) ?? []
+    const chain = [{ provider, model }]
+    for (const target of declared) {
+      chain.push({ provider: target.provider, model: target.model ?? model })
+    }
+    return chain
+  }
+
+  /**
+   * Stream one request against a single provider route — one key pool. Yields
+   * the request's chunks and returns whether it completed (`ok: true`) or ended
+   * on a captured account-level failure (`ok: false`). The caller's outer loop
+   * drives failover across routes; this method owns only this route's key-pool
+   * rotation, except that when `isLast` is false (a backup route remains) a
+   * captured switchable failure returns immediately so the caller can abandon
+   * this route for the backup rather than burning the remaining keys here.
+   *
+   * Inside the attempt loop the active key rotates between attempts via
+   * `resolveApiKey` + `onKeyFailure`, so a rate-limited or banned key yields to
+   * the next without ending the turn. A single-key or keyless route makes
+   * exactly one attempt — behavior unchanged. The image and context preparation
+   * stays inside the attempt's try so a caller abort still classifies as
+   * `ABORTED` rather than surfacing a raw conversion error.
+   * @param snapshot - the frozen profile/collection snapshot for this operation.
+   * @param provider - the provider route to stream against.
+   * @param modelId - the model id to stream against on this route.
+   * @param options - the original generate options (provider/model overridden per route).
+   * @param isLast - whether this is the last route in the failover chain.
+   */
+  private async * streamOnProvider(
+    snapshot: PiAiSnapshot,
+    provider: string,
+    modelId: string,
+    options: GenerateOptions,
+    isLast: boolean,
+  ): AsyncGenerator<StreamChunk, FailoverOutcome> {
+    const profile = this.profileOf(snapshot, provider)
+    const model = this.modelOf(snapshot, provider, modelId)
     const reasoning = resolveReasoningLevel(
       model,
       options.reasoningEffort ?? profile.reasoning,
     )
 
-    // Retry the request across the route's key pool on a key-specific
-    // rejection. Each attempt is its own SDK call; the active key rotates
-    // between attempts via `resolveApiKey` + `onKeyFailure`, so a rate-limited
-    // or banned key yields to the next without ending the turn. A single-key or
-    // keyless route makes exactly one attempt — behavior unchanged. The image
-    // and context preparation stays inside the attempt's try so a caller abort
-    // still classifies as `ABORTED` rather than surfacing a raw conversion error.
     const total = profile.apiKeyRefs.length
     for (let attempt = 0; ; attempt++) {
       const consumer = new AbortController()
@@ -322,7 +404,7 @@ export class PiAiAdapter extends LlmAdapter {
         ? consumer.signal
         : AbortSignal.any([options.signal, consumer.signal])
       using watchdog = idleWatchdog(upstream, profile.streamIdleTimeoutMs, 'LLM_STREAM_IDLE_TIMEOUT')
-      const apiKey = await this.config.resolveApiKey(options.provider, profile)
+      const apiKey = await this.config.resolveApiKey(provider, profile)
       try {
         const containsImage = options.messages.some(message => contentHasImage(message.content))
         if (containsImage && !model.input.includes('image')) {
@@ -347,7 +429,7 @@ export class PiAiAdapter extends LlmAdapter {
         })
         const iterator = toStreamChunks(events, model.contextWindow)[Symbol.asyncIterator]()
         let exhausted = false
-        let captured: FinishReason | undefined
+        let captured!: Extract<FinishReason, { kind: 'error' }>
         try {
           while (true) {
             const result = await watchdog.next(iterator)
@@ -355,11 +437,14 @@ export class PiAiAdapter extends LlmAdapter {
             if (timeout !== undefined) throw timeout
             if (result.done) {
               exhausted = true
-              return
+              return this.failoverOutcomeOk
             }
             const chunk = result.value
-            // A key-specific rejection ends the stream; swallow it and rotate
-            // to the next key rather than surfacing it, unless no key remains.
+            // A key-specific rejection ends the stream; swallow it. When a
+            // backup route remains, abandon this route for it (the caller hands
+            // the failure off) instead of rotating the remaining keys here.
+            // Otherwise rotate to the next key while one remains; once the pool
+            // is exhausted, surface the failure as the terminal chunk.
             if (chunk.type === 'finish' && chunk.reason.kind === 'error'
               && SWITCHABLE_FAILURE_CODES.has(chunk.reason.failure.code)) {
               captured = chunk.reason
@@ -377,15 +462,16 @@ export class PiAiAdapter extends LlmAdapter {
             }
           }
         }
-        // A switchable failure was captured inside the attempt loop (the only
-        // way to leave the inner `while` without returning). Rotate to the next
-        // key when one remains; otherwise surface the failure as the terminal chunk.
-        if (total > 1 && attempt < total - 1) {
-          this.config.onKeyFailure?.(options.provider, captured.failure.code)
-          continue
-        }
+        // The attempt loop only leaves via `return` on exhaustion (above) or a
+        // `break` after capturing a switchable failure, so `captured` is set.
+        // Cool the rejected key, then either hand the failure to the caller for
+        // failover (a backup route remains) or, on the last route, rotate to the
+        // next key while one remains, else surface the failure as the terminal chunk.
+        this.config.onKeyFailure?.(provider, captured.failure.code)
+        if (!isLast) return { ok: false, failure: captured }
+        if (total > 1 && attempt < total - 1) continue
         yield { type: 'finish', reason: captured }
-        return
+        return { ok: false, failure: captured }
       } catch (error: unknown) {
         if (timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT') !== undefined) {
           throw new LlmError(`pi-ai stream idle timeout after ${profile.streamIdleTimeoutMs}ms`, 'TIMEOUT', { cause: error })
@@ -400,3 +486,6 @@ export class PiAiAdapter extends LlmAdapter {
     }
   }
 }
+
+/** Outcome of streaming one provider route: success, or a captured account-level failure. */
+type FailoverOutcome = { ok: true } | { ok: false; failure: FinishReason }

@@ -75,7 +75,7 @@ The dict shape makes duplicate routes unrepresentable, and the pre-release array
 
 ## Catalog resolution
 
-A profile's `models` list *replaces* the route's installed catalog rather than extending it; omitting it (or leaving it empty) serves that catalog unchanged. Each entry defaults its unset fields from the installed model of the same `id`, so narrowing a catalog route to two models, correcting one capacity, or adding a model newer than the installed catalog are all one-line edits — but declaring any `models` list means every model the route should keep serving must appear in it, an entry of nothing but `id` being enough. The configurable entry fields are `id`, `name`, `contextWindow`, `maxTokens`, `reasoningEfforts`, and `compat`. Pricing and input modalities have no harness consumer and ride the installed entry or are absent.
+A profile's `models` list *replaces* the route's installed catalog rather than extending it; omitting it (or leaving it empty) serves that catalog unchanged. Each entry defaults its unset fields from the installed model of the same `id`, so narrowing a catalog route to two models, correcting one capacity, or adding a model newer than the installed catalog are all one-line edits — but declaring any `models` list means every model the route should keep serving must appear in it, an entry of nothing but `id` being enough. The configurable entry fields are `id`, `name`, `contextWindow`, `maxTokens`, `reasoningEfforts`, `compat`, and `failover`. Pricing and input modalities have no harness consumer and ride the installed entry or are absent.
 
 `modelOverrides` reshapes individual installed-catalog models without that cost: each key is a catalog model id, each value the same fields a `models` entry takes with the id living in the key, and the rest of the catalog keeps serving untouched — "correct one model, keep the other thirty-seven" as a three-line edit. An override becomes that catalog entry's configuration, so capacities, efforts, and compat resolve through the same path with the same diagnostics and the same request-default semantics as a `models` entry. Overrides are only meaningful on a catalog route serving its catalog: one set beside a `models` list (which already replaces the catalog), on a hand-declared route (whose models are fully spelled in `models`), or naming a model the catalog does not describe is refused rather than skipped, because a silently unchanged model is a typo someone would otherwise hunt for.
 
@@ -124,6 +124,43 @@ A route can serve more than one credential. `apiKeyEnv` stays the primary refere
 The rotation state lives in the plugin's `apply()` closure, keyed by route, and is shared between the per-request `resolveApiKey` (which picks the next usable key) and `onKeyFailure` (which cools the just-used key). Because `stream()` makes one provider request per attempt, a route with N keys retries up to N−1 times before surfacing the failure — there is no hidden multiplier. The state rebuilds when a route's reference pool changes identity, dropping stale cooldowns, so a settings edit takes effect on the next request.
 
 Compose this with the agent-level `llm-retry` policy deliberately: the adapter already handles rate-limit/quota failover, so the route's `retryPolicy` need not retry those codes (doing so would re-run the whole rotation loop). Leave `retryableCodes` for transient transport/server errors, or set `maxRetries: 0` to delegate all failover to the key pool.
+
+## Cross-provider failover
+
+Key-pool rotation saves a run when *one* key is rejected, but it cannot help when the rejection is **account-level**: a rate limit, a quota/ban, or a 403 `AUTH` denial that names the whole account rather than one credential. When a route's keys share one account — the common case for a vendor-supplied multi-key plan — an account cap (e.g. a "5-hour usage limit") rejects every key at once, so rotating within the route just replays the same denial until the pool is exhausted and the turn ends. The only recovery is a *different* account, which in practice means a different provider route.
+
+`failover` is a **per-model** list of backup routes that the adapter walks once the model's own key pool is exhausted on an account-level failure. Each entry names another route that also serves the model, with an optional `model` remap for the wire id when the backup spells the same model differently:
+
+```yaml
+providers:
+  sensenova-deepseek:
+    apiKeyEnv: SENSENOVA_API_KEY
+    apiKeyEnvs: [SENSENOVA_API_KEY_2, …, SENSENOVA_API_KEY_10]
+    api: openai-completions
+    baseURL: https://token.sensenova.cn/v1
+    models:
+      - id: deepseek-v4-flash
+        reasoningEfforts:
+          off:
+          high: high
+        failover:
+          - provider: qwen-token-plan
+            model: deepseek-v4-flash-0731
+  qwen-token-plan:
+    apiKeyEnv: QWEN_TOKEN_PLAN_API_KEY
+    baseURL: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+    models:
+      - id: deepseek-v4-flash-0731
+        reasoningEfforts:
+          off:
+          high: high
+```
+
+The failover chain is the selected route, then its declared backups in order. Inside one route the key pool rotates to exhaustion as above; only once *every* key on a route is spent does the adapter hand the captured failure to the next route, which starts its own pool fresh. A captured failure on the **last** route in the chain surfaces as the turn's terminal `finish {kind:'error'}`, so a fully exhausted chain still ends the turn exactly as before — failover only ever *adds* routes, it never loops or softens a genuine dead end. The chain is built from the *selected* model's `failover` only, so a backup route's own `failover` is ignored unless that backup is itself the selected route: there is no recursion and no ping-pong between two routes that list each other.
+
+`AUTH` (a 403) is one of the switchable codes, so a 403 account denial rotates the key pool exactly like a 429, and once the pool is spent hands off to the backup route — a model a route is not entitled to on its own account is retried on the backup's account rather than ending the turn. The same cross-route existence check refuses a `failover` entry that names its own route, an unknown route, or a route that does not serve the (remapped) model, so a typo fails load (`settings-rejected` naming the route and model) instead of silently abandoning a request to an unserviceable backup mid-turn.
+
+Compose the two mechanisms deliberately: the key pool is **intra-account** rotation (one key for another on the same vendor), `failover` is **cross-account / cross-vendor** rotation (one vendor for another). A single-key route with a `failover` skips straight to the backup on the first account-level rejection; a multi-key route exhausts its own pool first, then fails over. Both are inside one `stream()` call, so `retryPolicy` should still avoid retrying the same switchable codes, or set `maxRetries: 0`, lest the agent-level retry re-run the whole chain.
 
 ## Endpoint interrogation
 

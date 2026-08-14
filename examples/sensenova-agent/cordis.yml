@@ -66,26 +66,26 @@
           # `openai` is not one of the special-cased thinking formats, so request
           # building falls through to the generic OpenAI branch, which gates
           # every thinking parameter on `supportsReasoningEffort` — with it
-          # false, no thinking parameter is ever sent. SenseNova's OpenAI
-          # endpoint documents neither `reasoning_effort` nor the `developer`
-          # role nor the `store` field, and expects `max_tokens` (not
-          # `max_completion_tokens`), so the four switches below pin pi-ai's
-          # URL-based auto-detection to what SenseNova actually accepts.
+          # true, the selected effort is sent as `reasoning_effort`. SenseNova's
+          # OpenAI endpoint documents neither the `developer` role nor the
+          # `store` field, and expects `max_tokens` (not `max_completion_tokens`),
+          # so the remaining switches pin pi-ai's URL-based auto-detection to
+          # what SenseNova actually accepts.
           thinkingFormat: openai
-          supportsReasoningEffort: false
+          supportsReasoningEffort: true
           supportsDeveloperRole: false
           supportsStore: false
           maxTokensField: max_tokens
         models:
           - id: deepseek-v4-flash
             name: DeepSeek V4 Flash (SenseNova)
-            contextWindow: 128000
-            maxTokens: 8192
-            # Declares the model reasons; the wire level is never sent because
-            # `supportsReasoningEffort` is false, so this only labels capability.
+            contextWindow: 1000000
+            maxTokens: 32768
+            # Thinking + non-thinking: `off` sends nothing (non-thinking);
+            # `high` sends `reasoning_effort: high` (thinking mode).
             reasoningEfforts:
               off:
-              max: max
+              high: high
 
 # Managed child-process groups for the bash executor (spawn/kill/output plumbing).
 - id: subprocess
