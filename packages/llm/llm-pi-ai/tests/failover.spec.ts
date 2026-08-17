@@ -97,7 +97,9 @@ describe('pi-ai key-pool failover', () => {
       })],
     })
     expect(result.finish.kind).toBe('error')
-    if (result.finish.kind === 'error') expect(result.finish.failure.code).toBe('QUOTA')
+    // A multi-key pool ends as KEY_POOL_EXHAUSTED once every key rejected the
+    // same quota, so the agent loop stops instead of re-churning cooled keys.
+    if (result.finish.kind === 'error') expect(result.finish.failure.code).toBe('KEY_POOL_EXHAUSTED')
     expect(server.headers).toHaveLength(2)
     expect(server.headers[0]?.authorization).toBe('Bearer key-a')
     expect(server.headers[1]?.authorization).toBe('Bearer key-b')

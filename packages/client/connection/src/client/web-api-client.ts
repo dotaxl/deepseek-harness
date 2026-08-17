@@ -41,6 +41,10 @@ export class WebApiClient extends AbstractApiClient {
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
     const socket = new WebSocket(url)
     const inbox: SocketItem<F>[] = []
+    // Consumed entries advance a cursor instead of `shift()`ing: a busy session
+    // streams chunk-rate frames, and every `shift()` memmoves the remainder, so
+    // a large backlog drains quadratically and pins the tab's main thread.
+    let head = 0
     let wake: (() => void) | undefined
     const enqueue = (item: SocketItem<F>): void => {
       inbox.push(item)
@@ -73,8 +77,15 @@ export class WebApiClient extends AbstractApiClient {
     if (signal.aborted) handleAbort()
     try {
       while (true) {
-        while (inbox.length > 0) {
-          const item = inbox.shift() as SocketItem<F>
+        while (head < inbox.length) {
+          const item = inbox[head] as SocketItem<F>
+          head++
+          // Drop the consumed prefix once it dominates the live remainder, so
+          // the cursor does not turn the array into unbounded memory.
+          if (head > 1024 && head * 2 > inbox.length) {
+            inbox.splice(0, head)
+            head = 0
+          }
           if (item.kind === 'end') return
           yield item.envelope
         }

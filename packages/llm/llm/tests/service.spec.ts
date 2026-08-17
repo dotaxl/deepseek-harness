@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import LlmRuntime, {
+  CallId,
   errorChain,
   GenerateOptions,
   HarnessError,
@@ -13,7 +14,9 @@ import LlmRuntime, {
   resolveRetryPolicy,
   StreamChunk,
   createMessage,
+  createUserMessage,
 } from '@deepseek-ai/dsh-llm'
+import { AttachmentId } from '@deepseek-ai/dsh-attachment'
 import type {
   LlmModelContext,
   LlmModelInfo,
@@ -106,6 +109,8 @@ describe('LlmRuntime', () => {
     expect(isContextWindowExceededError('input is too long for this model')).toBe(true)
     expect(isContextWindowExceededError('request too large for model context')).toBe(true)
     expect(isContextWindowExceededError('input exceeds the model context window limit')).toBe(true)
+    expect(isContextWindowExceededError('the input prompt token len 338297 + max_new_tokens 7657 > 262144')).toBe(true)
+    expect(isContextWindowExceededError('token length 12345 > 6789')).toBe(true)
   })
 
   it('does not mistake unrelated input validation for context-window overflow', () => {
@@ -113,6 +118,8 @@ describe('LlmRuntime', () => {
     expect(isContextWindowExceededError('invalid input: temperature exceeds maximum allowed value')).toBe(false)
     expect(isContextWindowExceededError('input exceeds maximum allowed value')).toBe(false)
     expect(isContextWindowExceededError('context window size must be positive')).toBe(false)
+    expect(isContextWindowExceededError('token length: 12345')).toBe(false)
+    expect(isContextWindowExceededError('token length 12345 is less than 6789')).toBe(false)
   })
 
   it('distinguishes exhausted account quota from transient rate limiting', () => {
@@ -595,6 +602,67 @@ describe('LlmRuntime', () => {
       provider: 'route', id: 'model', name: 'Model',
       inputModalities: ['text', 'image'],
     })
+  })
+
+  it('degrades image blocks to placeholder text on a text-only input route', async () => {
+    const ctx = new Context()
+    await ctx.plugin(LlmRuntime)
+    const adapter = new class extends RecordingAdapter {
+      override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+        return Promise.resolve({
+          provider,
+          id: model,
+          name: model,
+          // Only the text-only route declares its input; the other stays
+          // undeclared so the adapter stays the enforcement point there.
+          ...model === 'text-only' ? { inputModalities: ['text'] as const } : {},
+        })
+      }
+    }(SCRIPT)
+    ctx.llm.registerAdapter(['route'], adapter)
+    const image = {
+      type: 'image' as const,
+      attachment: {
+        attachmentId: AttachmentId('att-1'),
+        mediaType: 'image/png' as const,
+        bytes: 1,
+        width: 1,
+        height: 1,
+      },
+    }
+    const messages = [
+      createUserMessage({ content: [image, { type: 'text', text: 'compare these' }], source: { kind: 'user' } }),
+      createUserMessage({
+        content: [{
+          type: 'tool-result',
+          toolCallId: CallId('call-1'),
+          content: [image, { type: 'text', text: 'legend' }],
+        }],
+        source: { kind: 'tool', callId: CallId('call-1') },
+      }),
+    ]
+    const request = Object.freeze({ provider: 'route', model: 'text-only', messages })
+
+    for await (const _chunk of ctx.llm.stream(request)) { /* drain */ }
+
+    expect(adapter.lastOptions?.messages.map(message => message.content)).toEqual([
+      [{ type: 'text', text: '[image omitted]' }, { type: 'text', text: 'compare these' }],
+      [{
+        type: 'tool-result',
+        toolCallId: CallId('call-1'),
+        content: [{ type: 'text', text: '[image omitted]' }, { type: 'text', text: 'legend' }],
+      }],
+    ])
+    expect(Object.isFrozen(adapter.lastOptions)).toBe(true)
+    // The caller's message objects keep their images; only the request degrades.
+    expect(messages[0]!.content[0]).toEqual(image)
+    const toolBlock = messages[1]!.content[0]!
+    if (toolBlock.type !== 'tool-result') throw new Error('expected a tool-result block')
+    expect(toolBlock.content[0]).toEqual(image)
+
+    for await (const _chunk of ctx.llm.stream({ provider: 'route', model: 'undeclared', messages })) { /* drain */ }
+    expect(adapter.lastOptions?.messages[0]).toBe(messages[0])
+    await ctx.fiber.dispose()
   })
 
   it('resolves detached model context independently of advisory catalog membership', async () => {

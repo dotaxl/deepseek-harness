@@ -31,6 +31,12 @@ import type {
   PiAiReasoningEfforts,
 } from './catalog.ts'
 import { buildProvider, supportedProtocols } from './provider.ts'
+import {
+  DEFAULT_KEY_BALANCE_WINDOW_MS,
+  DEFAULT_KEY_PIN_BY_SESSION,
+  DEFAULT_KEY_SESSION_PIN_MS,
+  DEFAULT_KEY_STICKY_MS,
+} from './key-rotation.ts'
 
 /** Default maximum idle interval while an adapter stream read is outstanding. */
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000
@@ -95,6 +101,37 @@ export interface PiAiProviderProfile {
    * {@link DEFAULT_RATE_LIMIT_COOLDOWN_MS} (60 seconds).
    */
   rateLimitCooldownMs?: number
+  /**
+   * Rolling window (ms) over which the balancer counts each key's requests to
+   * spread load. Inside the window the adapter prefers the least-used available
+   * key so traffic does not concentrate on one key; the count resets wholesale
+   * when the window elapses. Default {@link DEFAULT_KEY_BALANCE_WINDOW_MS}
+   * (5 hours), matching the default quota cooldown.
+   */
+  keyBalanceWindowMs?: number
+  /**
+   * Stickiness (ms): a selected key stays pinned this long before the balancer
+   * re-evaluates and may move to a different key. Pinning keeps a key in use
+   * for a stretch so the provider's per-key prompt cache stays warm — switching
+   * keys every request would scatter that cache — while the window still lets
+   * the balancer rebalance periodically. Default {@link DEFAULT_KEY_STICKY_MS}
+   * (5 minutes).
+   */
+  keyStickyMs?: number
+  /**
+   * Session affinity: when a request names a session, pin that session to one
+   * key so concurrent sessions spread across the pool instead of all hammering
+   * one key (which is what trips a single key's 429). The first request of a
+   * session picks the least-loaded available key and the session keeps it for
+   * {@link keySessionPinMs}. Default {@link DEFAULT_KEY_PIN_BY_SESSION} (true).
+   */
+  keyPinBySession?: boolean
+  /**
+   * Session-pin lifetime (ms) before it expires and is re-chosen. Bounds the pin
+   * map for abandoned sessions and lets a long-idle session rebalance to a
+   * quieter key. Default {@link DEFAULT_KEY_SESSION_PIN_MS} (30 minutes).
+   */
+  keySessionPinMs?: number
   /** Name shown by configuration surfaces; defaults to the route key. */
   displayName?: string
   /**
@@ -185,6 +222,14 @@ export interface ResolvedPiAiProviderProfile
   keyCooldownMs: number
   /** Cooldown (ms) for a key after a rate-limit rejection. */
   rateLimitCooldownMs: number
+  /** Rolling window (ms) for per-key usage accounting. */
+  keyBalanceWindowMs: number
+  /** Stickiness (ms): how long a chosen key stays pinned before rebalancing. */
+  keyStickyMs: number
+  /** Whether a request naming a session pins that session to one key. */
+  keyPinBySession: boolean
+  /** Session-pin lifetime (ms) before it expires and is re-chosen. */
+  keySessionPinMs: number
   /** Positive finite provider-idle interval after defaulting. */
   streamIdleTimeoutMs: number
   /** Immutable retry policy captured with this provider route. */
@@ -310,6 +355,10 @@ const profile = z.object({
   streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   keyCooldownMs: z.natural(),
   rateLimitCooldownMs: z.natural(),
+  keyBalanceWindowMs: z.natural(),
+  keyStickyMs: z.natural(),
+  keyPinBySession: z.boolean(),
+  keySessionPinMs: z.natural(),
   retryPolicy: RetryPolicySchema,
 })
 
@@ -414,6 +463,10 @@ export function resolveProfiles(
       apiKeyEnvs,
       keyCooldownMs,
       rateLimitCooldownMs,
+      keyBalanceWindowMs,
+      keyStickyMs,
+      keyPinBySession,
+      keySessionPinMs,
       retryPolicy,
       models: _models,
       displayName: _displayName,
@@ -431,6 +484,10 @@ export function resolveProfiles(
       apiKeyRefs,
       keyCooldownMs: keyCooldownMs ?? DEFAULT_KEY_COOLDOWN_MS,
       rateLimitCooldownMs: rateLimitCooldownMs ?? DEFAULT_RATE_LIMIT_COOLDOWN_MS,
+      keyBalanceWindowMs: keyBalanceWindowMs ?? DEFAULT_KEY_BALANCE_WINDOW_MS,
+      keyStickyMs: keyStickyMs ?? DEFAULT_KEY_STICKY_MS,
+      keyPinBySession: keyPinBySession ?? DEFAULT_KEY_PIN_BY_SESSION,
+      keySessionPinMs: keySessionPinMs ?? DEFAULT_KEY_SESSION_PIN_MS,
       streamIdleTimeoutMs,
       retryPolicy: resolveRetryPolicy(retryPolicy, `llm-pi-ai: provider "${provider}" retryPolicy`),
       ...rest.headers === undefined ? {} : { headers: { ...rest.headers } },

@@ -19,12 +19,17 @@ let ctx: Context | undefined
 try {
   loadEnv(NAME)
   ctx = await boot(NAME, resolveConfigPath(configPath, undefined))
-  const resolved = await ctx.llm.resolveModelInfo('sensenova-deepseek', 'deepseek-v4-flash')
+  const flash = await ctx.llm.resolveModelInfo('sensenova-deepseek', 'deepseek-v4-flash')
+  const lite = await ctx.llm.resolveModelInfo('sensenova-deepseek', 'sensenova-6.8-flash-lite')
   process.stdout.write(`${JSON.stringify({
     ok: true,
-    provider: resolved.provider,
-    id: resolved.id,
-    contextWindow: resolved.context?.contextWindow,
+    flash: { provider: flash.provider, id: flash.id, contextWindow: flash.context?.contextWindow },
+    lite: {
+      provider: lite.provider,
+      id: lite.id,
+      contextWindow: lite.context?.contextWindow,
+      inputModalities: lite.inputModalities,
+    },
   })}\n`)
 } catch (error: unknown) {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)

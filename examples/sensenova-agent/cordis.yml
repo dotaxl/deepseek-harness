@@ -1,22 +1,25 @@
 # One-shot coding agent backed by SenseNova's OpenAI-compatible endpoint,
-# serving DeepSeek V4 Flash through it. The app bin loads the gitignored root
-# `.env` into the process environment; entry configs here are the composition
-# base, while user-plane values resolve per request through the two providers
-# below.
+# serving DeepSeek V4 Flash and SenseNova 6.8 Flash Lite through it. The app
+# bin loads the gitignored root `.env` into the process environment; entry
+# configs here are the composition base, while user-plane values resolve per
+# request through the two providers below.
 #
 # This profile reuses the pi-ai-backed LLM adapter (`@deepseek-ai/dsh-llm-pi-ai`)
-# with a hand-declared route — no package source change. SenseNova speaks the
+# with hand-declared routes — no package source change. SenseNova speaks the
 # OpenAI Chat Completions protocol, so `api: openai-completions` reuses pi-ai's
 # existing adapter. Its thinking output arrives under `message.reasoning` /
 # `delta.reasoning`, which pi-ai already reads, so reasoning streams through
-# unchanged. `compat.supportsReasoningEffort: false` keeps the adapter from
-# sending a `reasoning_effort` parameter the SenseNova endpoint does not
-# document; the model's own default thinking still surfaces in the response.
+# unchanged. The endpoint accepts `reasoning_effort` (verified by a live
+# probe), so `compat.supportsReasoningEffort: true` sends the selected effort;
+# `off` sends nothing and the endpoint's default thinking still surfaces.
 #
-# Set `SENSENOVA_API_KEY` (and the `SENSENOVA_API_KEY_2`…`_8` pool below) in
-# the environment or root `.env` (gitignored). The adapter rotates through all
-# eight on a rate limit or a quota ban (e.g. a multi-hour circuit break) before
-# giving up, so one saturated key does not stop the run.
+# Set `SENSENOVA_API_KEY` (and the `SENSENOVA_API_KEY_2`…`_10` pool below) and
+# `QWEN_TOKEN_PLAN_API_KEY` in the environment or root `.env` (gitignored). The
+# adapter rotates through all SenseNova keys on a rate limit or a quota ban
+# (e.g. a multi-hour circuit break) before giving up, so one saturated key does
+# not stop the run; once the whole pool is spent on an account-level failure,
+# each SenseNova model's `failover` hands the turn to the qwen-token-plan
+# route, which serves the remapped model on a separate account.
 
 # User-settings document (`$DSH_HOME/settings.yaml`, hot-reloaded): a
 # `llm-pi-ai:` section there overrides the adapter entry below without a
@@ -32,13 +35,13 @@
 
 # The SenseNova-backed LLM adapter: a hand-declared `openai-completions` route
 # pointed at SenseNova's token endpoint. Swap the model id if SenseNova lists
-# DeepSeek V4 Flash under a different string.
+# a model under a different string.
 - id: llm-pi-ai
   name: '@deepseek-ai/dsh-llm-pi-ai'
   config:
     providers:
       sensenova-deepseek:
-        displayName: SenseNova DeepSeek V4 Flash
+        displayName: SenseNova
         apiKeyEnv: SENSENOVA_API_KEY
         # Key pool: on a rate limit (429) or a quota ban, the adapter cools the
         # rejecting key down and retries with the next reference rather than
@@ -80,11 +83,46 @@
           - id: deepseek-v4-flash
             name: DeepSeek V4 Flash (SenseNova)
             contextWindow: 1000000
-            maxTokens: 32768
+            maxTokens: 65536
             # Thinking + non-thinking: `off` sends nothing (non-thinking);
             # `high` sends `reasoning_effort: high` (thinking mode).
             reasoningEfforts:
               off:
+              high: high
+            # Cross-account backup once every key above is spent on an
+            # account-level failure; the qwen route serves the remapped id.
+            failover:
+              - provider: qwen-token-plan
+                model: deepseek-v4-flash-0731
+          - id: sensenova-6.8-flash-lite
+            name: SenseNova 6.8 Flash Lite
+            contextWindow: 262144
+            maxTokens: 65536
+            # Gateway metadata declares text+image input.
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off:
+              high: high
+            failover:
+              - provider: qwen-token-plan
+                model: deepseek-v4-flash-0731
+      # Failover target for the SenseNova models above. `qwen-token-plan` ships
+      # in pi-ai's installed catalog, so the route needs no `api` of its own;
+      # the entry narrows it to the one model the failover entries remap to.
+      qwen-token-plan:
+        apiKeyEnv: QWEN_TOKEN_PLAN_API_KEY
+        baseURL: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+        compat:
+          supportsDeveloperRole: false
+        models:
+          - id: deepseek-v4-flash-0731
+            name: deepseek-v4-flash-0731
+            contextWindow: 1000000
+            maxTokens: 384000
+            reasoningEfforts:
+              off: null
               high: high
 
 # Managed child-process groups for the bash executor (spawn/kill/output plumbing).

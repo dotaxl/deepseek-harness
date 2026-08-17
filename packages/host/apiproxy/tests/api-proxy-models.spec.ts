@@ -196,7 +196,7 @@ describe('Web session model selection', () => {
     await ctx.fiber.dispose()
   })
 
-  it('refuses a text-only selection while durable or pending image content remains visible', async () => {
+  it('allows a text-only selection over durable image history but refuses while images are queued', async () => {
     const { ctx, agent, sessionId } = await harness()
     registerTextOnly(ctx)
     const api = createApiProxy(ctx, {
@@ -210,23 +210,18 @@ describe('Web session model selection', () => {
     agent.session.append('user/message', {
       id: 'image-message', role: 'user', source: { kind: 'user' }, content: [image],
     } as never, { surfaceOp: 'append' })
-    expect((await api.sessions.selectModel(request({
+    // Durable history degrades to placeholder text at dispatch, so the
+    // selection over an image-bearing transcript is free.
+    expect(expectValue(await api.sessions.selectModel(request({
       sessionId, provider: 'text-only', model: 'plain',
-    }))).result).toMatchObject({ ok: false, error: { code: 'model-unavailable' } })
+    }))).selected).toEqual({ provider: 'text-only', model: 'plain' })
 
-    agent.session.append('user/message', {
-      id: 'summary', role: 'user', source: { kind: 'plugin', plugin: 'compact' },
-      content: [{ type: 'text', text: 'image summarized' }],
-    } as never, {
-      surfaceOp: { op: 'replace', start: 0, end: agent.session.events.length - 1 },
-      sourceEventSeqs: agent.session.events.map(event => event.seq),
-    })
     ;(agent.inbox.nextTurn as UserMessage[]).push({
       id: 'pending-image', role: 'user', source: { kind: 'user' }, content: [image],
     } as never)
     expect((await api.sessions.selectModel(request({
       sessionId, provider: 'text-only', model: 'plain',
-    }))).result.ok).toBe(false)
+    }))).result).toMatchObject({ ok: false, error: { code: 'model-unavailable' } })
     ;(agent.inbox.nextTurn as UserMessage[]).length = 0
     expect(expectValue(await api.sessions.selectModel(request({
       sessionId, provider: 'text-only', model: 'plain',

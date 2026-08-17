@@ -8,6 +8,7 @@
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import type {
+  ContentBlock,
   GenerateOptions,
   LlmConfigurableProvider,
   LlmDiscoveredModel,
@@ -21,6 +22,7 @@ import type {
   StreamChunk,
 } from './types.ts'
 import { freezeMessage, type Message } from './message.ts'
+import { contentHasImage } from './content.ts'
 import { resolveRetryPolicy } from './retry-policy.ts'
 import type { ResolvedRetryPolicy } from './retry-policy.ts'
 import type { ProviderRequestId } from './brand.ts'
@@ -735,7 +737,7 @@ export class LlmRuntime extends Service {
     registration: AdapterRegistration,
     config: LlmCallConfig,
     signal?: AbortSignal,
-  ): Promise<{ config: LlmCallConfig; context?: LlmModelContext }> {
+  ): Promise<{ config: LlmCallConfig; context?: LlmModelContext; inputModalities?: readonly ModelModality[] }> {
     const info = await this.resolveModelInfoFor(registration, config.model, signal)
     const defaulted = config.maxTokens === undefined && info.defaultMaxTokens !== undefined
       ? { ...config, maxTokens: info.defaultMaxTokens }
@@ -765,6 +767,7 @@ export class LlmRuntime extends Service {
     return {
       config: resolvedConfig,
       ...info.context === undefined ? {} : { context: info.context },
+      ...info.inputModalities === undefined ? {} : { inputModalities: info.inputModalities },
     }
   }
 
@@ -808,7 +811,11 @@ export class LlmRuntime extends Service {
           )
         }
         dispatched = true
-        return this.streamWithRegistration(options, { registration, config: resolvedConfig })
+        return this.streamWithRegistration(options, {
+          registration,
+          config: resolvedConfig,
+          ...resolved.inputModalities === undefined ? {} : { inputModalities: resolved.inputModalities },
+        })
       },
     })
   }
@@ -836,20 +843,41 @@ export class LlmRuntime extends Service {
   }
 
   /**
+   * Replace image blocks with placeholder text when the target route declares
+   * text-only input. Undeclared modalities stay untouched: the adapter remains
+   * the enforcement point for content it actually rejects. Only the request is
+   * degraded — the session log keeps the original image and any prior
+   * assistant analysis of it.
+   */
+  private degradeForInput(
+    options: GenerateOptions,
+    inputModalities: readonly ModelModality[] | undefined,
+  ): GenerateOptions {
+    if (inputModalities === undefined || inputModalities.includes('image')) return options
+    if (!options.messages.some(message => contentHasImage(message.content))) return options
+    const messages = options.messages.map(message => contentHasImage(message.content)
+      ? freezeMessage({ ...message, content: degradeContent(message.content) })
+      : message)
+    const degraded = { ...options, messages }
+    return Object.isFrozen(options) ? deepFreeze(degraded) : degraded
+  }
+
+  /**
    * Final adapter boundary. Adapter selection, dispatch, iterator construction,
    * and iteration failures become one terminal failure chunk. Middleware and
    * downstream consumer failures remain thrown plugin or consumer errors.
    */
   private async * adapterStream(
     options: GenerateOptions,
-    prepared?: { registration: AdapterRegistration; config: LlmCallConfig },
+    prepared?: { registration: AdapterRegistration; config: LlmCallConfig; inputModalities?: readonly ModelModality[] },
   ): AsyncGenerator<StreamChunk> {
     let iterator: AsyncIterator<StreamChunk>
     try {
       const registration = prepared?.registration ?? this.registration(options.provider)
-      const resolvedConfig = prepared === undefined
-        ? (await this.resolveCallFor(registration, options, options.signal)).config
-        : prepared.config
+      const resolved = prepared === undefined
+        ? await this.resolveCallFor(registration, options, options.signal)
+        : { config: prepared.config, inputModalities: prepared.inputModalities }
+      const resolvedConfig = resolved.config
       if (prepared !== undefined && !callConfigEquals(options, resolvedConfig)) {
         throw new LlmError(
           'prepared LLM call config changed before adapter dispatch',
@@ -862,7 +890,9 @@ export class LlmRuntime extends Service {
           ? deepFreeze({ ...options, ...resolvedConfig })
           : { ...options, ...resolvedConfig }
       const adapter = registration.adapter
-      const stream = adapter.stream(this.forAdapter(resolvedOptions, adapter))
+      const stream = adapter.stream(
+        this.forAdapter(this.degradeForInput(resolvedOptions, resolved.inputModalities), adapter),
+      )
       iterator = stream[Symbol.asyncIterator]()
     } catch (error: unknown) {
       yield adapterFailureChunk(error, options.signal)
@@ -916,7 +946,7 @@ export class LlmRuntime extends Service {
 
   private streamWithRegistration(
     options: GenerateOptions,
-    prepared?: { registration: AdapterRegistration; config: LlmCallConfig },
+    prepared?: { registration: AdapterRegistration; config: LlmCallConfig; inputModalities?: readonly ModelModality[] },
   ): AsyncIterable<StreamChunk> {
     return this.ctx.waterfall(
       this,
@@ -925,6 +955,20 @@ export class LlmRuntime extends Service {
       () => this.adapterStream(options, prepared),
     )
   }
+}
+
+/** Placeholder replacing an image block on a text-only input route. */
+const OMITTED_IMAGE = '[image omitted]'
+
+/** Replace every image block, including nested tool-result content, with placeholder text. */
+function degradeContent(content: readonly ContentBlock[]): ContentBlock[] {
+  return content.map((block): ContentBlock => {
+    if (block.type === 'image') return { type: 'text', text: OMITTED_IMAGE }
+    if (block.type === 'tool-result' && contentHasImage(block.content)) {
+      return { ...block, content: degradeContent(block.content) }
+    }
+    return block
+  })
 }
 
 /** Convert one adapter throw into the stream protocol's terminal outcome. */

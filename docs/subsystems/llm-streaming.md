@@ -178,6 +178,12 @@ type StreamChunk =
     reason: FinishReason
     /** Adapter-private lossless-JSON state for replaying a successful response. */
     replayState?: unknown
+    /**
+     * Route and model that actually produced the response. An adapter-level
+     * redirection (key-pool or cross-provider failover) may answer on a
+     * different route than requested; absent means the requested route answered.
+     */
+    answeredBy?: { provider: string; model: string }
   }
 ```
 
@@ -298,6 +304,8 @@ declare class BlockAssembler {
   get finish(): FinishReason;
   /** Adapter-private replay state from the terminal finish chunk, if any. */
   get replayState(): unknown;
+  /** Route and model that actually answered, when the adapter reported them. */
+  get answeredBy(): { provider: string; model: string } | undefined;
   /**
    * The assembled assistant message.
    * @param source - producer attribution for the assembled message.
@@ -835,7 +843,7 @@ async prepareCall(config: LlmCallConfig, signal?: AbortSignal): Promise<Prepared
 stream(options: GenerateOptions): AsyncIterable<StreamChunk>
 ```
 
-Source: [`packages/llm/llm/src/index.ts:284`](../../packages/llm/llm/src/index.ts)
+Source: [`packages/llm/llm/src/index.ts:286`](../../packages/llm/llm/src/index.ts)
 
 <a id="llm-events"></a>
 
@@ -884,5 +892,5 @@ Waterfall around every streaming model call (retry, replay, routing). Bound to t
 'llm/stream'(this: LlmRuntime, options: GenerateOptions, next: () => AsyncIterable<StreamChunk>): AsyncIterable<StreamChunk>
 ```
 
-Source: [`packages/llm/llm/src/index.ts:64`](../../packages/llm/llm/src/index.ts)
+Source: [`packages/llm/llm/src/index.ts:66`](../../packages/llm/llm/src/index.ts)
 <!-- END GENERATED cordis-surface -->

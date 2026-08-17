@@ -191,6 +191,10 @@ export async function* toStreamChunks(
           type: 'finish',
           reason: mapStopReason(event.message, contextWindow),
           replayState: toPiReplayState(event.message),
+          // A failover chain may have answered on a backup route under its own
+          // wire model; the loop stamps the assistant source from this so it
+          // stays in agreement with the replay state beside it.
+          answeredBy: { provider: event.message.provider, model: event.message.model },
         }
         return
       case 'error':

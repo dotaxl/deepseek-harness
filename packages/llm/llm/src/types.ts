@@ -300,6 +300,12 @@ export type StreamChunk =
     reason: FinishReason
     /** Adapter-private lossless-JSON state for replaying a successful response. */
     replayState?: unknown
+    /**
+     * Route and model that actually produced the response. An adapter-level
+     * redirection (key-pool or cross-provider failover) may answer on a
+     * different route than requested; absent means the requested route answered.
+     */
+    answeredBy?: { provider: string; model: string }
   }
 
 /**

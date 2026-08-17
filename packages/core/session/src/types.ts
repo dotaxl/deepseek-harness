@@ -167,6 +167,13 @@ export interface TurnEndReasonMap {
   /** At least one step reached its output-token ceiling, even if a plugin continued the turn. */
   'max-tokens': { kind: 'max-tokens' }
   /**
+   * The run reached its step budget: one step is one model round-trip, so an
+   * unbounded chatty run would balloon the session log (and, co-located on one
+   * Node loop, the web UI) without limit. The loop ends gracefully; this is a
+   * budget outcome, not a failure.
+   */
+  'max-steps': { kind: 'max-steps' }
+  /**
    * A persistence backend closed a crash-orphaned turn on reload. The loop never
    * emits this marker, and the events recorded before the crash remain intact.
    */

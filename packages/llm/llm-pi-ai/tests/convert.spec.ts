@@ -484,28 +484,30 @@ describe('toPiContext', () => {
   }
 
   it.each([
-    ['provider', { ...validReplay, provider: 'openai' }],
-    ['model', { ...validReplay, model: 'deepseek-v4-pro' }],
-  ])('rejects replay metadata whose %s differs from assistant source', (field, replayState) => {
-    try {
-      toPiContext({
-        provider: 'deepseek',
-        model: 'next-model',
-        messages: [createMessage({
-          role: 'assistant',
-          content: [{ type: 'text', text: 'done' }],
-          source: {
-            kind: 'model',
-            ...{ provider: 'deepseek', model: 'deepseek-v4-flash', replayState },
-          },
-        })],
-      })
-      expect.fail('expected invalid replay state')
-    } catch (error: unknown) {
-      expect(error).toBeInstanceOf(LlmError)
-      expect((error as LlmError).code).toBe('INVALID_REPLAY_STATE')
-      expect((error as Error).message).toContain(`${field} does not match assistant source`)
-    }
+    ['provider', { ...validReplay, provider: 'openai', blocks: [{ type: 'text', textSignature: 'sig' }] }],
+    ['model', { ...validReplay, model: 'deepseek-v4-pro', blocks: [{ type: 'text', textSignature: 'sig' }] }],
+  ])('degrades to a foreign projection when replay metadata %s differs from assistant source', (_field, replayState) => {
+    // Logs written before finish chunks carried the answering route record the
+    // requested route as source while a cross-provider failover answered on the
+    // backup: the durable content survives, pi-ai signature continuity does not.
+    const context = toPiContext({
+      provider: 'deepseek',
+      model: 'next-model',
+      messages: [createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'done' }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'deepseek', model: 'deepseek-v4-flash', replayState },
+        },
+      })],
+    })
+    expect(context.messages[0]).toMatchObject({
+      role: 'assistant',
+      api: 'dsh-foreign',
+      provider: 'deepseek',
+      content: [{ type: 'text', text: 'done' }],
+    })
   })
 
   it.each([
@@ -573,6 +575,7 @@ describe('toStreamChunks', () => {
           stopReason: 'stop',
           blocks: [{ type: 'text' }],
         },
+        answeredBy: { provider: 'deepseek', model: 'deepseek-v4-flash' },
       },
     ])
   })
@@ -622,6 +625,7 @@ describe('toStreamChunks', () => {
           stopReason: 'toolUse',
           blocks: [{ type: 'tool-call' }],
         },
+        answeredBy: { provider: 'deepseek', model: 'deepseek-v4-flash' },
       },
     ])
   })

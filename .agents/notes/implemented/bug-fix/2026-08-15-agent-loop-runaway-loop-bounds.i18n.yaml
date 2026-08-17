@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/bug-fix/2026-08-15-agent-loop-runaway-loop-bounds.md
+2026-08-15-agent-loop-runaway-loop-bounds.md: c749bd37de5f3da3b9ca6bd683fdb6404369d725
+2026-08-15-agent-loop-runaway-loop-bounds.zh.md: 9594f8bfd4fdfdf9426b9f8a501ea5fc97323bd5

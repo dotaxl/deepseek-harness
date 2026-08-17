@@ -195,6 +195,32 @@ describe('agent loop', () => {
     expect(messages[1]!.content).toEqual([{ type: 'text', text: 'hello there' }])
   })
 
+  it('stamps the assistant source with the route that answered, falling back to the requested route', async () => {
+    const answeredElsewhere = textResponse('backup answer')
+    // A failover chain answers on another route; the finish chunk says so.
+    answeredElsewhere[answeredElsewhere.length - 1] = {
+      type: 'finish',
+      reason: { kind: 'stop' },
+      answeredBy: { provider: 'backup', model: 'backup-model' },
+    }
+    const adapter = new MockAdapter([answeredElsewhere, textResponse('requested answer')])
+    const ctx = await harness(adapter)
+    const agent = ctx.agentLoop.create(SessionId('answered-by'), { provider: 'mock', model: 'mock' })
+
+    send(agent, 'first')
+    await waitForIdle(ctx, agent)
+    send(agent, 'second')
+    await waitForIdle(ctx, agent)
+
+    const sources = agent.session.events
+      .filter(e => e.type === 'assistant/message')
+      .map(e => e.type === 'assistant/message' ? e.data.message.source : undefined)
+    expect(sources).toEqual([
+      { kind: 'model', provider: 'backup', model: 'backup-model' },
+      { kind: 'model', provider: 'mock', model: 'mock' },
+    ])
+  })
+
   it('round-trips tool calls: model requests tool → executes → result in next request', async () => {
     const adapter = new MockAdapter([
       toolCallResponse('c1', 'echo', { text: 'ping' }, 'calling echo'),

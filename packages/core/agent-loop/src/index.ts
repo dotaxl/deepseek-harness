@@ -27,7 +27,12 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { ReactLoopAgent } from './agent.ts'
-import { DEFAULT_MAX_PARALLEL_TOOL_CALLS } from './constants.ts'
+import {
+  DEFAULT_MAX_CONSECUTIVE_REQUEST_FAILURES,
+  DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+  DEFAULT_MAX_STEPS,
+  DEFAULT_MAX_TURNS,
+} from './constants.ts'
 
 /** Fiber states that cannot own or serve a new lifecycle. */
 const INACTIVE_STATES: ReadonlySet<FiberState> = new Set([
@@ -184,7 +189,12 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
-export { DEFAULT_MAX_PARALLEL_TOOL_CALLS }
+export {
+  DEFAULT_MAX_CONSECUTIVE_REQUEST_FAILURES,
+  DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+  DEFAULT_MAX_STEPS,
+  DEFAULT_MAX_TURNS,
+}
 
 /**
  * One launcher-selected session identity for a configured agent. `resume`
@@ -258,6 +268,27 @@ export interface Config {
    * omission defaults to {@link DEFAULT_MAX_PARALLEL_TOOL_CALLS}.
    */
   maxParallelToolCalls?: number
+  /**
+   * Run-wide turn cap. A run ends gracefully once exceeded, bounding a
+   * runaway loop that never converges. Omission defaults to
+   * {@link DEFAULT_MAX_TURNS}.
+   */
+  maxTurns?: number
+  /**
+   * Maximum consecutive failed LLM requests before the run stops. Caps the
+   * in-step retry loop so a persistently failing endpoint (e.g. an account
+   * cap returning 429) ends the turn instead of spinning forever. Omission
+   * defaults to {@link DEFAULT_MAX_CONSECUTIVE_REQUEST_FAILURES}.
+   */
+  maxConsecutiveRequestFailures?: number
+  /**
+   * Run-wide step cap. One step is one model round-trip, so an unbounded
+   * chatty run would balloon the session log (and, co-located on one Node
+   * loop, the web UI) without limit. The run ends gracefully on the budget
+   * instead of spinning forever. Omission defaults to
+   * {@link DEFAULT_MAX_STEPS}.
+   */
+  maxSteps?: number
   /** Agents created or resumed at plugin startup. */
   agents: (AgentOptions & {
     /** Stable config label used in logs and as the fresh combined-id prefix. */
@@ -272,7 +303,12 @@ export interface Config {
 }
 
 /** Agent-loop configuration after defaults and load-time validation. */
-type ResolvedConfig = Config & { maxParallelToolCalls: number }
+type ResolvedConfig = Config & {
+  maxParallelToolCalls: number
+  maxTurns: number
+  maxConsecutiveRequestFailures: number
+  maxSteps: number
+}
 
 /** Reject self-contained identity conflicts before any configured agent starts. */
 function validateConfiguredAgents(agents: Config['agents']): void {
@@ -299,6 +335,9 @@ export class AgentLoop extends Service implements AgentFactory {
   /** Runtime schema for declarative agents. */
   static Config = z.object({
     maxParallelToolCalls: z.number().step(1).min(1).default(DEFAULT_MAX_PARALLEL_TOOL_CALLS),
+    maxTurns: z.number().step(1).min(1).default(DEFAULT_MAX_TURNS),
+    maxConsecutiveRequestFailures: z.number().step(1).min(1).default(DEFAULT_MAX_CONSECUTIVE_REQUEST_FAILURES),
+    maxSteps: z.number().step(1).min(1).default(DEFAULT_MAX_STEPS),
     agents: z.array(z.object({
       id: z.string().required(),
       sessionId: z.string().min(1),
@@ -331,6 +370,9 @@ export class AgentLoop extends Service implements AgentFactory {
       get maxParallelToolCalls() {
         return source().maxParallelToolCalls
       },
+      maxTurns: config.maxTurns ?? DEFAULT_MAX_TURNS,
+      maxConsecutiveRequestFailures: config.maxConsecutiveRequestFailures ?? DEFAULT_MAX_CONSECUTIVE_REQUEST_FAILURES,
+      maxSteps: config.maxSteps ?? DEFAULT_MAX_STEPS,
     }
     installSettingsSection(ctx, AGENT_LOOP_SETTINGS_NAMESPACE, AGENT_LOOP_SETTINGS_SCHEMA, entry, {
       // The schema admits any integer above zero; `resolveMaxParallelToolCalls`

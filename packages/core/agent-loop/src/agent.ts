@@ -19,6 +19,7 @@ import { Inbox, agentEvents, assembleContextFor } from '@deepseek-ai/dsh-agent'
 import type { GenerateOptions, LlmCallConfig, Message, PreparedLlmCall } from '@deepseek-ai/dsh-llm'
 import {
   BlockAssembler,
+  KEY_POOL_EXHAUSTED_CODE,
   LlmError,
   createAssistantMessage,
   deepFreeze,
@@ -75,6 +76,10 @@ export class ReactLoopAgent implements Agent {
 
   /** Whether this loop instance has appended its initial/resume request anchor. */
   private requestHeaderLogged = false
+  /** Consecutive failed LLM requests in the current run; resets on a successful step. */
+  private consecutiveRequestFailures = 0
+  /** Model round-trips executed in the current run; resets when the driver opens. */
+  private totalSteps = 0
   private readonly runtimeContext: RuntimeContextProjection
 
   constructor(
@@ -189,6 +194,9 @@ export class ReactLoopAgent implements Agent {
       step: 0,
       wakeRequested: false,
     })
+    // A fresh run opens its step budget; the cap counts round-trips across the
+    // whole run, so a chatty run ends instead of ballooning the session log.
+    this.totalSteps = 0
     this.loopCtx.agents.withInitiator(this, () => this.kick()).then(driver.resolve, driver.reject)
   }
 
@@ -251,6 +259,14 @@ export class ReactLoopAgent implements Agent {
     const { signal } = phase.abort
     signal.throwIfAborted()
     const turn = phase.turn + 1
+    const maxTurns = this.loopCtx.agentLoop.config.maxTurns
+    if (turn > maxTurns) {
+      this.loopCtx.logger.warn(
+        `agent "${this.id}": reached maxTurns (${maxTurns}); stopping run`,
+      )
+      return false
+    }
+    this.consecutiveRequestFailures = 0
     try {
       this.session.append('turn/start', { turn })
     } catch (error: unknown) {
@@ -262,6 +278,16 @@ export class ReactLoopAgent implements Agent {
     try {
       while (true) {
         signal.throwIfAborted()
+        // Run-wide step cap: one step is one model round-trip, so a chatty run
+        // ends gracefully on its budget instead of ballooning the session log
+        // (and, co-located on one Node loop, the web UI) without limit.
+        if (this.totalSteps >= this.loopCtx.agentLoop.config.maxSteps) {
+          this.loopCtx.logger.warn(
+            `agent "${this.id}": reached maxSteps (${this.loopCtx.agentLoop.config.maxSteps}); stopping run`,
+          )
+          turnEnds = { kind: 'max-steps' }
+          return false
+        }
         const step = phase.step + 1
         const decision = await this.preStep(target, { turn, step })
         if (decision.kind === 'reject') {
@@ -278,6 +304,7 @@ export class ReactLoopAgent implements Agent {
         signal.throwIfAborted()
         this.session.append('step/start', { turn, step })
         phase.step = step
+        this.totalSteps++
         try {
           for (const message of decision.messages) {
             this.session.append('user/message', message, { surfaceOp: 'append' })
@@ -352,6 +379,7 @@ export class ReactLoopAgent implements Agent {
       signal.throwIfAborted()
       const finish = assembler.finish
       if (finish.kind === 'error' || finish.kind === 'aborted') {
+        this.consecutiveRequestFailures++
         const action = await this.dispatch.waterfall(
           'agent/request-error', {
             turn,
@@ -364,17 +392,26 @@ export class ReactLoopAgent implements Agent {
           () => Promise.resolve<RequestErrorAction>(undefined),
         )
         signal.throwIfAborted()
-        if (action?.kind !== 'retry') {
+        // A wholesale key-pool exhaustion is terminal: every key was already
+        // tried and cooled, so retrying would only re-exercise the cooled pool
+        // until the cooldown elapses. Stop the run even if a recovery listener
+        // asks to retry.
+        if (action?.kind !== 'retry' || finish.failure.code === KEY_POOL_EXHAUSTED_CODE) {
+          throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
+        }
+        if (this.consecutiveRequestFailures >= this.loopCtx.agentLoop.config.maxConsecutiveRequestFailures) {
           throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
         }
         continue
       }
+      this.consecutiveRequestFailures = 0
 
       const message = createAssistantMessage({
         content: assembler.blocks(),
         source: {
-          provider: request.provider,
-          model: request.model,
+          // The source names the producer: a failover chain may have answered
+          // on a backup route, and the replay state records that route.
+          ...assembler.answeredBy ?? { provider: request.provider, model: request.model },
           ...assembler.replayState !== undefined ? { replayState: assembler.replayState } : {},
         },
       })

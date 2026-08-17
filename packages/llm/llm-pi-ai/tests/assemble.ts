@@ -22,8 +22,8 @@ export async function assemble(ctx: Context, options: Omit<GenerateOptions, 'pro
   return {
     message: assembler.message({
       kind: 'model',
-      provider: request.provider,
-      model: request.model,
+      // Mirrors the agent loop: the source names the route that answered.
+      ...assembler.answeredBy ?? { provider: request.provider, model: request.model },
       ...assembler.replayState === undefined ? {} : { replayState: assembler.replayState },
     }),
     ...assembler.usage !== undefined ? { usage: assembler.usage } : {},

@@ -231,11 +231,6 @@ function imageInEvent(event: SessionEvent, match: (ref: ImageAttachmentRef) => b
   return undefined
 }
 
-/** True when the current model-visible surface contains an image. */
-function messagesHaveImage(messages: readonly { content: readonly ContentBlock[] }[]): boolean {
-  return messages.some(message => contentHasImage(message.content))
-}
-
 /** Resolve the first reference matching one opaque id. */
 function referencedImage(events: readonly SessionEvent[], attachmentId: string): ImageAttachmentRef | undefined {
   for (const event of events) {
@@ -410,9 +405,19 @@ function presetFailure(request: RpcRequest<unknown>, error: unknown): RpcRespons
   return undefined
 }
 
-/** Simple async queue: core callbacks push, the AsyncIterable pulls; abort/return cleans up. */
+/**
+ * Simple async queue: core callbacks push, the AsyncIterable pulls; abort/return cleans up.
+ * Consumed entries advance a head cursor instead of `shift()`ing: a downlink that
+ * falls behind an active agent's chunk-rate event stream can buffer tens of
+ * thousands of frames, and every `shift()` memmoves the whole remainder, making
+ * the drain quadratic (the dominant hot path of a co-located `dsh --profile
+ * web` host at near-full CPU). The cursor makes dequeue O(1) amortized; the
+ * buffer compacts only when consumed prefix dominates, so it does not grow
+ * without bound either.
+ */
 class FrameQueue<F> {
   private buffer: F[] = []
+  private head = 0
   private waiter: (() => void) | undefined
   private done = false
 
@@ -427,12 +432,25 @@ class FrameQueue<F> {
     this.waiter?.()
   }
 
+  /** Drop the consumed prefix once it dominates the live remainder. */
+  private compact(): void {
+    if (this.head > 1024 && this.head * 2 > this.buffer.length) {
+      this.buffer.splice(0, this.head)
+      this.head = 0
+    }
+  }
+
   async *iterate(signal: AbortSignal, cleanup: () => void): AsyncGenerator<F> {
     const onAbort = (): void => { this.end() }
     signal.addEventListener('abort', onAbort, { once: true })
     try {
       while (true) {
-        while (this.buffer.length > 0) yield this.buffer.shift() as F
+        while (this.head < this.buffer.length) {
+          const item = this.buffer[this.head] as F
+          this.head++
+          yield item
+          this.compact()
+        }
         if (this.done || signal.aborted) return
         await new Promise<void>((resolve) => { this.waiter = resolve })
         this.waiter = undefined
@@ -2292,14 +2310,19 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
                 ? {}
                 : { reasoningEffort: ReasoningEffortId(reasoningEffort) },
             })
+            // Only inbox images gate the selection: they ship as fresh input
+            // the text-only route would reject. Durable history does not gate —
+            // the LLM runtime degrades historical image blocks to placeholder
+            // text for text-only routes, keeping the logged image and any
+            // prior analysis of it.
             const pendingImage = [...found.agent.inbox.nextTurn, ...found.agent.inbox.nextStep]
               .some(message => contentHasImage(message.content))
-            if (pendingImage || messagesHaveImage(found.agent.session.deriveMessages())) {
+            if (pendingImage) {
               const info = await ctx.llm.resolveModelInfo(resolved.provider, resolved.model)
               if (info.inputModalities !== undefined && !info.inputModalities.includes('image')) {
                 return err(request, {
                   code: 'model-unavailable',
-                  message: `Model "${resolved.model}" does not accept image input, but this session already contains images; select an image-capable model.`,
+                  message: `Model "${resolved.model}" does not accept image input, but images are queued for the next turn; select an image-capable model.`,
                   details: { provider, model },
                 })
               }

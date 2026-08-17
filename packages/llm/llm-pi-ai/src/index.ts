@@ -70,6 +70,7 @@ import { PiAiAdapter } from './adapter.ts'
 import { catalogProviderIds, catalogProviderTakesApiKey } from './catalog.ts'
 import { assertServiceable, Config, resolveProfiles } from './config.ts'
 import {
+  clearSessionPin,
   coolDownKey,
   createKeyRotationState,
   selectActiveKey,
@@ -193,7 +194,12 @@ export function apply(ctx: Context, config: Config): void {
   function rotationStateFor(provider: string, profile: ResolvedPiAiProviderProfile): KeyRotationState {
     const existing = rotation.get(provider)
     if (existing !== undefined && existing.refs === profile.apiKeyRefs) return existing
-    const created = createKeyRotationState(profile.apiKeyRefs)
+    const created = createKeyRotationState(profile.apiKeyRefs, {
+      windowMs: profile.keyBalanceWindowMs,
+      stickyMs: profile.keyStickyMs,
+      pinBySession: profile.keyPinBySession,
+      sessionPinMs: profile.keySessionPinMs,
+    })
     rotation.set(provider, created)
     return created
   }
@@ -201,10 +207,12 @@ export function apply(ctx: Context, config: Config): void {
   const resolveApiKey = async (
     provider: string,
     profile: ResolvedPiAiProviderProfile,
+    sessionId?: string,
   ): Promise<string | undefined> => {
     // Pick the next usable key from this route's rotation pool; an empty pool
-    // (no apiKeyEnv and no apiKeyEnvs) defers to pi-ai's own discovery.
-    const ref = selectActiveKey(rotationStateFor(provider, profile), Date.now())
+    // (no apiKeyEnv and no apiKeyEnvs) defers to pi-ai's own discovery. A
+    // session id pins the session to one key so concurrent sessions spread.
+    const ref = selectActiveKey(rotationStateFor(provider, profile), Date.now(), sessionId)
     // Only a profile that names no credential at all defers to pi-ai's
     // provider-native discovery. Once one is named, a miss must fail loud:
     // handing pi-ai `undefined` would let it pick up an unrelated ambient key
@@ -229,13 +237,20 @@ export function apply(ctx: Context, config: Config): void {
   // the next request rotates to a different one. `QUOTA` is the hard ban
   // (e.g. a multi-hour circuit break) and uses the longer cooldown; any other
   // switchable failure cools the key only briefly.
-  const onKeyFailure = (provider: string, code: string): void => {
+  const onKeyFailure = (provider: string, code: string, sessionId?: string): void => {
     const profile = profiles().get(provider)
     if (profile === undefined || profile.apiKeyRefs.length === 0) return
+    const state = rotationStateFor(provider, profile)
     const cooldownMs = code === QUOTA_EXCEEDED_CODE
       ? profile.keyCooldownMs
       : profile.rateLimitCooldownMs
-    coolDownKey(rotationStateFor(provider, profile), cooldownMs, Date.now())
+    // Ban the key this session actually used (its pinned key), not just the
+    // route's current index, so a session failure releases the right key.
+    const banIndex = sessionId !== undefined
+      ? state.sessionPins.get(sessionId)?.index ?? state.index
+      : state.index
+    coolDownKey(state, cooldownMs, Date.now(), banIndex)
+    if (sessionId !== undefined) clearSessionPin(state, sessionId)
   }
 
   const adapter = new PiAiAdapter({

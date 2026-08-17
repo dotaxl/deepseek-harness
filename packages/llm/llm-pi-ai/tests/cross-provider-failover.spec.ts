@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import LlmRuntime, { createUserMessage } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { createUserMessage, KEY_POOL_EXHAUSTED_CODE } from '@deepseek-ai/dsh-llm'
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
 import type { PiAiModelProfile } from '@deepseek-ai/dsh-llm-pi-ai'
 import { closeMockServers, mockServer, textEvents } from './mock-server.ts'
@@ -54,6 +54,7 @@ async function dualHarness(
 async function singleHarness(baseURL: string, overrides: Record<string, unknown> = {}): Promise<Context> {
   vi.stubEnv('PI_KEY_A', 'key-a')
   vi.stubEnv('PI_KEY_B', 'key-b')
+  vi.stubEnv('PI_KEY_C', 'key-c')
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(LlmPiAi, {
@@ -77,6 +78,9 @@ describe('pi-ai cross-provider failover', () => {
     const result = await assemble(ctx, { provider: 'primary', model: 'deepseek-v4-flash', messages })
     expect(result.finish).toEqual({ kind: 'stop' })
     expect(result.message.content).toEqual([{ type: 'text', text: 'hello' }])
+    // The message names the route that answered, keeping its source in
+    // agreement with the replay state beside it.
+    expect(result.message.source).toMatchObject({ kind: 'model', provider: 'backup', model: 'deepseek-v4-flash' })
     expect(server.headers).toHaveLength(2)
     expect(server.headers[0]?.authorization).toBe('Bearer key-a')
     expect(server.headers[1]?.authorization).toBe('Bearer key-b')
@@ -109,6 +113,8 @@ describe('pi-ai cross-provider failover', () => {
     )
     const result = await assemble(ctx, { provider: 'primary', model: 'deepseek-v4-flash', messages })
     expect(result.finish).toEqual({ kind: 'stop' })
+    // The answering route is recorded under its remapped wire model.
+    expect(result.message.source).toMatchObject({ kind: 'model', provider: 'backup', model: 'deepseek-v4-flash-0731' })
     expect(server.headers).toHaveLength(2)
     // The backup request must carry the remapped id on the wire.
     expect(JSON.stringify(server.requests[1])).toContain('deepseek-v4-flash-0731')
@@ -127,6 +133,33 @@ describe('pi-ai key-pool rotation on AUTH', () => {
     expect(server.headers).toHaveLength(2)
     expect(server.headers[0]?.authorization).toBe('Bearer key-a')
     expect(server.headers[1]?.authorization).toBe('Bearer key-b')
+  })
+})
+
+describe('pi-ai key-pool exhaustion', () => {
+  it('names the terminal failure KEY_POOL_EXHAUSTED after every key in a pool is rate-limited', async () => {
+    const server = await mockServer([
+      { status: 429, body: RATE_LIMIT_BODY },
+      { status: 429, body: RATE_LIMIT_BODY },
+      { status: 429, body: RATE_LIMIT_BODY },
+    ])
+    const ctx = await singleHarness(server.url, { apiKeyEnv: 'PI_KEY_A', apiKeyEnvs: ['PI_KEY_B', 'PI_KEY_C'] })
+    const result = await assemble(ctx, { provider: 'route', model: 'deepseek-v4-flash', messages })
+    expect(result.finish.kind).toBe('error')
+    if (result.finish.kind === 'error') expect(result.finish.failure.code).toBe(KEY_POOL_EXHAUSTED_CODE)
+    expect(server.headers).toHaveLength(3)
+    expect(server.headers[0]?.authorization).toBe('Bearer key-a')
+    expect(server.headers[1]?.authorization).toBe('Bearer key-b')
+    expect(server.headers[2]?.authorization).toBe('Bearer key-c')
+  })
+
+  it('keeps the per-key RATE_LIMIT code when the route has only one key', async () => {
+    const server = await mockServer([{ status: 429, body: RATE_LIMIT_BODY }])
+    const ctx = await singleHarness(server.url, { apiKeyEnv: 'PI_KEY_A' })
+    const result = await assemble(ctx, { provider: 'route', model: 'deepseek-v4-flash', messages })
+    expect(result.finish.kind).toBe('error')
+    if (result.finish.kind === 'error') expect(result.finish.failure.code).toBe('RATE_LIMIT')
+    expect(server.headers).toHaveLength(1)
   })
 })
 

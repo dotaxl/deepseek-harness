@@ -22,13 +22,22 @@ describe('sensenova-agent keyless smoke', () => {
     expect(line).toBeDefined()
     const resolved = JSON.parse(line!) as {
       ok: boolean
-      provider: string
-      id: string
-      contextWindow: number | undefined
+      flash: { provider: string; id: string; contextWindow: number | undefined }
+      lite: { provider: string; id: string; contextWindow: number | undefined; inputModalities?: string[] }
     }
     expect(resolved.ok).toBe(true)
-    expect(resolved.provider).toBe('sensenova-deepseek')
-    expect(resolved.id).toBe('deepseek-v4-flash')
-    expect(resolved.contextWindow).toBe(128000)
+    expect(resolved.flash).toEqual({
+      provider: 'sensenova-deepseek',
+      id: 'deepseek-v4-flash',
+      contextWindow: 1000000,
+    })
+    // The gateway declares text+image input; the declared route must surface it
+    // so image admission treats the lite model as image-capable.
+    expect(resolved.lite).toEqual({
+      provider: 'sensenova-deepseek',
+      id: 'sensenova-6.8-flash-lite',
+      contextWindow: 262144,
+      inputModalities: ['text', 'image'],
+    })
   })
 })

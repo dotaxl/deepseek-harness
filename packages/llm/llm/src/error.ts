@@ -47,6 +47,18 @@ export const EMPTY_RESPONSE_CODE = 'EMPTY_RESPONSE'
  */
 export const INVALID_CREDENTIAL_CODE = 'INVALID_CREDENTIAL'
 
+/**
+ * Canonical provider-neutral code for a request route whose entire credential
+ * pool was tried and every key rejected with a key-specific failure (rate
+ * limit, quota, or account auth). Distinct from the per-key `RATE_LIMIT` /
+ * `QUOTA` / `AUTH` codes so the agent loop can stop the run immediately
+ * instead of retrying through a pool that has already failed wholesale:
+ * retrying would only re-exercise every cooled-down key and burn requests
+ * until the configured cooldown elapses. A single-key route never emits this
+ * code; its failure stays the original per-key code.
+ */
+export const KEY_POOL_EXHAUSTED_CODE = 'KEY_POOL_EXHAUSTED'
+
 /** Structured codes and plain phrases that explicitly name a context bound being exceeded. */
 const STRUCTURED_CONTEXT_OVERFLOW = new RegExp(
   String.raw`(?:^|[^a-z0-9])context[\s_-](?:length|window)[\s_-]`
@@ -70,6 +82,9 @@ const EXCEEDS_MODEL_CONTEXT = new RegExp(
   'i',
 )
 
+/** SenseNova‑style numeric comparison: "input prompt token len 338297 + max_new_tokens 7657 > 262144". */
+const TOKEN_LEN_COMPARISON = /\btoken\s+len(?:gth)?\b.{0,80}>\s*\d[\d,]*\b/i
+
 /**
  * Recognize the context-overflow wording used by OpenAI-compatible providers
  * and library adapters. Adapters pass all available provider code, type, and
@@ -83,6 +98,7 @@ export function isContextWindowExceededError(detail: string): boolean {
     || TOO_LARGE_FOR_CONTEXT.test(detail)
     || /\b(?:input|prompt|request)\s+(?:is\s+)?too\s+(?:long|large)\s+for\s+(?:this|the)\s+model\b/i.test(detail)
     || EXCEEDS_MODEL_CONTEXT.test(detail)
+    || TOKEN_LEN_COMPARISON.test(detail)
 }
 
 /**

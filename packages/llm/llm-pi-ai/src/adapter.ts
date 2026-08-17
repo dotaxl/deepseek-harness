@@ -35,6 +35,7 @@ import {
   attributionHeaders,
   contentHasImage,
   FinishReason,
+  KEY_POOL_EXHAUSTED_CODE,
   LlmAdapter,
   LlmError,
   QUOTA_EXCEEDED_CODE,
@@ -73,20 +74,23 @@ export interface PiAiAdapterOptions {
    * pi-ai auth, which for an installed catalog route is its provider-native
    * ambient discovery; the plugin allows that only for a profile naming no
    * credential at all, because a named reference that misses throws `LlmError`
-   * `MISSING_CREDENTIAL` rather than falling back.
+   * `MISSING_CREDENTIAL` rather than falling back. `sessionId` is the session
+   * the request belongs to, used for session-affinity key pinning when present.
    */
-  resolveApiKey: (provider: string, profile: ResolvedPiAiProviderProfile) => Promise<string | undefined>
+  resolveApiKey: (provider: string, profile: ResolvedPiAiProviderProfile, sessionId?: string) => Promise<string | undefined>
   /** Resolve the optional durable attachment service at request time. */
   resolveAttachments?: () => AttachmentStore | undefined
   /**
    * Called when a stream ends on a key-specific rejection (rate limit or a
    * cooled-down quota/ban). The plugin stamps the just-used key as cooled down
    * here so the next request rotates to a different one; the adapter never
-   * mutates rotation state itself.
+   * mutates rotation state itself. `sessionId` is the session that just failed,
+   * so its pinned key can be released for rebalancing.
    * @param provider - the route whose key was rejected.
    * @param code - the harness failure code (`RATE_LIMIT` or `QUOTA`).
+   * @param sessionId - the session whose request was rejected, if any.
    */
-  onKeyFailure?: (provider: string, code: string) => void
+  onKeyFailure?: (provider: string, code: string, sessionId?: string) => void
 }
 
 /**
@@ -404,7 +408,7 @@ export class PiAiAdapter extends LlmAdapter {
         ? consumer.signal
         : AbortSignal.any([options.signal, consumer.signal])
       using watchdog = idleWatchdog(upstream, profile.streamIdleTimeoutMs, 'LLM_STREAM_IDLE_TIMEOUT')
-      const apiKey = await this.config.resolveApiKey(provider, profile)
+      const apiKey = await this.config.resolveApiKey(provider, profile, options.sessionId)
       try {
         const containsImage = options.messages.some(message => contentHasImage(message.content))
         if (containsImage && !model.input.includes('image')) {
@@ -467,11 +471,20 @@ export class PiAiAdapter extends LlmAdapter {
         // Cool the rejected key, then either hand the failure to the caller for
         // failover (a backup route remains) or, on the last route, rotate to the
         // next key while one remains, else surface the failure as the terminal chunk.
-        this.config.onKeyFailure?.(provider, captured.failure.code)
+        this.config.onKeyFailure?.(provider, captured.failure.code, options.sessionId)
         if (!isLast) return { ok: false, failure: captured }
         if (total > 1 && attempt < total - 1) continue
-        yield { type: 'finish', reason: captured }
-        return { ok: false, failure: captured }
+        // The whole key pool was tried and every key rejected with a key-specific
+        // failure (rate limit, quota, or account auth): retrying would only
+        // re-exercise the now-cooled keys, so name the terminal failure distinctly
+        // so the agent loop can stop the run instead of churning the pool. A
+        // single-key route keeps the original per-key code — pool exhaustion is
+        // meaningless for one key.
+        const terminal: Extract<FinishReason, { kind: 'error' }> = total > 1
+          ? { kind: 'error', failure: { ...captured.failure, code: KEY_POOL_EXHAUSTED_CODE } }
+          : captured
+        yield { type: 'finish', reason: terminal }
+        return { ok: false, failure: terminal }
       } catch (error: unknown) {
         if (timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT') !== undefined) {
           throw new LlmError(`pi-ai stream idle timeout after ${profile.streamIdleTimeoutMs}ms`, 'TIMEOUT', { cause: error })

@@ -159,8 +159,15 @@ function foreignAssistant(message: Message): AssistantMessage {
 /** Recombine durable Harness content with validated pi-ai replay metadata. */
 function replayedAssistant(message: Message, source: ModelMessageSource, rawState: unknown): AssistantMessage {
   const state = readReplayState(rawState)
-  if (state.provider !== source.provider) return invalidReplay('provider does not match assistant source')
-  if (state.model !== source.model) return invalidReplay('model does not match assistant source')
+  // A provider or model mismatch means the state was captured on a different
+  // route than the message's source names: logs written before finish chunks
+  // carried the answering route record the requested route as source while a
+  // cross-provider failover answered on the backup. The content is still the
+  // durable truth; only pi-ai signature continuity is lost, so degrade to a
+  // foreign projection instead of failing every later turn of the session.
+  if (state.provider !== source.provider || state.model !== source.model) {
+    return foreignAssistant(message)
+  }
   if (state.blocks.length !== message.content.length) return invalidReplay('block count does not match assistant content')
   const content: AssistantMessage['content'] = message.content.map((block, index) => {
     const replay = state.blocks[index]

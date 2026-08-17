@@ -14,6 +14,8 @@ import type { FsErrorCode } from '@deepseek-ai/dsh-fs'
 const REMEDIES: Partial<Record<FsErrorCode, string>> = {
   FS_STALE_VERSION: 're-read the file, then retry',
   FS_NOT_OBSERVED: 'read the file, then retry',
+  FS_EDIT_NOT_FOUND: 'the exact text was not found — re-read the file to get the current content, then retry with the exact text from the file',
+  FS_AMBIGUOUS_EDIT: 'the text matched multiple times — provide a more specific old_string or set replace_all to true',
 }
 
 /**

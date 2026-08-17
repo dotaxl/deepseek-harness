@@ -39,6 +39,7 @@ export class BlockAssembler {
   private _usage: TokenUsage | undefined
   private _finish: FinishReason | undefined
   private _replayState: unknown = undefined
+  private _answeredBy: { provider: string; model: string } | undefined
 
   /**
    * Feed one chunk into the assembly state.
@@ -87,6 +88,7 @@ export class BlockAssembler {
       case 'finish': {
         this._finish = chunk.reason
         this._replayState = chunk.replayState
+        this._answeredBy = chunk.answeredBy
         return
       }
       default: return assertNever(chunk, 'BlockAssembler.push')
@@ -151,6 +153,11 @@ export class BlockAssembler {
   /** Adapter-private replay state from the terminal finish chunk, if any. */
   get replayState(): unknown {
     return this._replayState
+  }
+
+  /** Route and model that actually answered, when the adapter reported them. */
+  get answeredBy(): { provider: string; model: string } | undefined {
+    return this._answeredBy
   }
 
   /**
